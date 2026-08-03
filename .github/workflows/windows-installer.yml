@@ -92,7 +92,11 @@ jobs:
       - name: Smoke-test install and uninstall
         shell: pwsh
         run: |
-          $installer = Get-ChildItem -LiteralPath dist -Filter 'Xyra-Setup-*-x64.exe' | Select-Object -Single
+          $installers = @(Get-ChildItem -LiteralPath dist -Filter 'Xyra-Setup-*-x64.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Xyra installer, but found $($installers.Count)."
+          }
+          $installer = $installers[0]
           $installDirectory = Join-Path $env:RUNNER_TEMP 'XyraInstallerSmoke'
           $install = Start-Process -FilePath $installer.FullName -WindowStyle Hidden -Wait -PassThru -ArgumentList @(
             '/VERYSILENT',
@@ -120,7 +124,11 @@ jobs:
       - name: Generate SHA-256 checksum
         shell: pwsh
         run: |
-          $installer = Get-ChildItem -LiteralPath dist -Filter 'Xyra-Setup-*-x64.exe' | Select-Object -Single
+          $installers = @(Get-ChildItem -LiteralPath dist -Filter 'Xyra-Setup-*-x64.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Xyra installer, but found $($installers.Count)."
+          }
+          $installer = $installers[0]
           $hash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $($installer.Name)" | Set-Content -LiteralPath "$($installer.FullName).sha256" -Encoding ascii
 
