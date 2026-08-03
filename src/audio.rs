@@ -1,5 +1,7 @@
 use std::{path::Path, process::Command};
 
+use crate::windows_audio::{WASAPI_RENDER_PREFIX, enumerate_render_devices};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevice {
     pub name: String,
@@ -18,34 +20,35 @@ pub fn enumerate_audio_devices(ffmpeg: &Path) -> std::io::Result<Vec<AudioDevice
             "dummy",
         ])
         .output()?;
-    Ok(parse_dshow_devices(&String::from_utf8_lossy(
+    let mut devices = enumerate_render_devices().unwrap_or_default();
+    devices.extend(parse_dshow_devices(&String::from_utf8_lossy(
         &output.stderr,
-    )))
+    )));
+    Ok(devices)
 }
 
 pub fn recommended_microphone(devices: &[AudioDevice]) -> Option<&AudioDevice> {
     devices
         .iter()
-        .find(|device| {
-            let name = device.name.to_ascii_lowercase();
-            (name.contains("microphone") || name.contains("mic"))
-                && !looks_like_desktop_audio(&name)
-        })
+        .find(|device| is_microphone_device(device))
         .or_else(|| {
             devices
                 .iter()
-                .find(|device| !looks_like_desktop_audio(&device.name))
+                .find(|device| !is_desktop_audio_device(device))
         })
 }
 
 pub fn recommended_desktop_audio(devices: &[AudioDevice]) -> Option<&AudioDevice> {
     devices
         .iter()
-        .find(|device| looks_like_desktop_audio(&device.name))
+        .find(|device| is_desktop_audio_device(device))
 }
 
-fn looks_like_desktop_audio(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
+pub fn is_desktop_audio_device(device: &AudioDevice) -> bool {
+    if device.id.starts_with(WASAPI_RENDER_PREFIX) {
+        return true;
+    }
+    let name = device.name.to_ascii_lowercase();
     [
         "stereo mix",
         "what u hear",
@@ -57,6 +60,15 @@ fn looks_like_desktop_audio(name: &str) -> bool {
     ]
     .iter()
     .any(|hint| name.contains(hint))
+}
+
+pub fn is_microphone_device(device: &AudioDevice) -> bool {
+    let name = device.name.to_ascii_lowercase();
+    !is_desktop_audio_device(device)
+        && (name.contains("microphone")
+            || name.contains(" mic")
+            || name.starts_with("mic")
+            || name.contains("headset"))
 }
 
 fn parse_dshow_devices(output: &str) -> Vec<AudioDevice> {
@@ -110,5 +122,12 @@ mod tests {
             recommended_desktop_audio(&devices).unwrap().id,
             "@device_stream"
         );
+        assert!(is_microphone_device(&devices[0]));
+        assert!(!is_microphone_device(&devices[1]));
+        assert!(is_desktop_audio_device(&devices[1]));
+        assert!(is_desktop_audio_device(&AudioDevice {
+            name: "Speakers".into(),
+            id: format!("{WASAPI_RENDER_PREFIX}endpoint"),
+        }));
     }
 }

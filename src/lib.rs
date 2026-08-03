@@ -7,3 +7,6 @@ pub mod library;
 pub mod model;
 pub mod player;
 pub mod publish;
+pub mod startup;
+pub mod system_tray;
+pub mod windows_audio;

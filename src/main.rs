@@ -1,16 +1,23 @@
-use std::path::PathBuf;
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use chrono::Utc;
 use eframe::egui::{self, Color32, RichText};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState, hotkey::HotKey};
 use uuid::Uuid;
 use xyra::{
     audio::{
-        AudioDevice, enumerate_audio_devices, recommended_desktop_audio, recommended_microphone,
+        AudioDevice, enumerate_audio_devices, is_desktop_audio_device, is_microphone_device,
+        recommended_desktop_audio, recommended_microphone,
     },
     capture::CaptureManager,
     config::{
-        AppConfig, CaptureQuality, EncoderBackend, VideoAspectRatio, VideoCodec,
-        managed_ffmpeg_path,
+        AppConfig, CaptureQuality, ClipHotkey, EncoderBackend, HotkeyModifier, VideoAspectRatio,
+        VideoCodec, managed_ffmpeg_path,
     },
     display::{MonitorInfo, enumerate_monitors, selected_monitor},
     ffmpeg::{FfmpegInstaller, InstallState},
@@ -18,20 +25,26 @@ use xyra::{
     model::{Clip, EditProject, Platform, PublishJob, PublishStatus, PublishTarget},
     player::{PREVIEW_HEIGHT, PREVIEW_WIDTH, VideoPlayer},
     publish::{PublishQueue, connection_help},
+    startup::sync_startup_registration,
+    system_tray::{SystemTray, TrayAction},
 };
 
 fn main() -> eframe::Result {
+    let autostart_launch = std::env::args().any(|argument| argument == "--autostart");
+    let start_hidden = autostart_launch
+        && AppConfig::load().is_ok_and(|config| config.start_minimized_on_system_start);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("Xyra"),
+            .with_title("Xyra")
+            .with_visible(!start_hidden),
         ..Default::default()
     };
     eframe::run_native(
         "Xyra",
         options,
-        Box::new(|cc| Ok(Box::new(XyraApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(XyraApp::new(cc, start_hidden)))),
     )
 }
 
@@ -79,10 +92,18 @@ struct XyraApp {
     search: String,
     monitors: Vec<MonitorInfo>,
     audio_devices: Vec<AudioDevice>,
+    saved_config_state: String,
+    config_save_due: Option<Instant>,
+    hotkey_manager: Option<GlobalHotKeyManager>,
+    registered_hotkeys: Vec<(HotKey, u32)>,
+    hotkey_config_state: String,
+    hotkey_status: String,
+    tray: Option<SystemTray>,
+    quit_requested: bool,
 }
 
 impl XyraApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, started_hidden: bool) -> Self {
         configure_style(&cc.egui_ctx);
         let mut config = AppConfig::load().unwrap_or_default();
         let ffmpeg_ready = CaptureManager::ffmpeg_available(&config);
@@ -92,22 +113,42 @@ impl XyraApp {
             Vec::new()
         };
         sync_audio_device_selection(&mut config, &audio_devices);
+        // Rewrite older, partial config files immediately so every newly added setting persists.
+        let _ = config.save();
+        let saved_config_state = serde_json::to_string(&config).unwrap_or_default();
         let ffmpeg_input = config.ffmpeg_path.display().to_string();
         let ffmpeg_installer = FfmpegInstaller::new(
             config.ffmpeg_path.clone(),
             config.ffmpeg_path == managed_ffmpeg_path(),
         );
-        let status = if ffmpeg_ready {
+        let mut status = if ffmpeg_ready {
             "Ready to capture".into()
         } else {
             ffmpeg_installer.state().label()
         };
+        if let Err(error) = sync_startup_registration(config.start_with_windows) {
+            status = format!("Could not update Windows startup: {error}");
+        }
+        let tray = match SystemTray::new(&cc.egui_ctx) {
+            Ok(tray) => Some(tray),
+            Err(error) => {
+                status = format!("System tray is unavailable: {error}");
+                if started_hidden {
+                    cc.egui_ctx
+                        .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+                None
+            }
+        };
+        if started_hidden && tray.is_some() {
+            status = "Xyra started in the system tray".into();
+        }
         let clips = scan_clips(
             &config.clips_directory,
             ffmpeg_ready.then_some(config.ffmpeg_path.as_path()),
         )
         .unwrap_or_default();
-        Self {
+        let mut app = Self {
             config,
             capture: CaptureManager::default(),
             clips,
@@ -125,6 +166,136 @@ impl XyraApp {
             search: String::new(),
             monitors: enumerate_monitors(),
             audio_devices,
+            saved_config_state,
+            config_save_due: None,
+            hotkey_manager: GlobalHotKeyManager::new().ok(),
+            registered_hotkeys: Vec::new(),
+            hotkey_config_state: String::new(),
+            hotkey_status: String::new(),
+            tray,
+            quit_requested: false,
+        };
+        app.refresh_hotkeys();
+        app
+    }
+
+    fn refresh_hotkeys(&mut self) {
+        if let Some(manager) = &self.hotkey_manager {
+            let old_hotkeys = self
+                .registered_hotkeys
+                .iter()
+                .map(|(hotkey, _)| *hotkey)
+                .collect::<Vec<_>>();
+            let _ = manager.unregister_all(&old_hotkeys);
+        }
+        self.registered_hotkeys.clear();
+        self.hotkey_config_state =
+            serde_json::to_string(&self.config.clip_hotkeys).unwrap_or_default();
+
+        let Some(manager) = &self.hotkey_manager else {
+            self.hotkey_status = "Global hotkeys are unavailable on this system".into();
+            return;
+        };
+
+        let mut failures = Vec::new();
+        for configured in self
+            .config
+            .clip_hotkeys
+            .iter()
+            .filter(|hotkey| hotkey.enabled)
+        {
+            let hotkey = match native_hotkey(configured) {
+                Ok(hotkey) => hotkey,
+                Err(error) => {
+                    failures.push(error);
+                    continue;
+                }
+            };
+            if self
+                .registered_hotkeys
+                .iter()
+                .any(|(registered, _)| registered.id() == hotkey.id())
+            {
+                failures.push(format!("{} is assigned more than once", configured.label()));
+                continue;
+            }
+            match manager.register(hotkey) {
+                Ok(()) => self
+                    .registered_hotkeys
+                    .push((hotkey, configured.clip_seconds.max(5))),
+                Err(error) => failures.push(format!(
+                    "{} could not be registered: {error}",
+                    configured.label()
+                )),
+            }
+        }
+
+        self.hotkey_status = if failures.is_empty() {
+            format!(
+                "{} global clip hotkey{} active",
+                self.registered_hotkeys.len(),
+                if self.registered_hotkeys.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        } else {
+            failures.join("  ")
+        };
+    }
+
+    fn poll_hotkeys(&mut self) {
+        let current_state = serde_json::to_string(&self.config.clip_hotkeys).unwrap_or_default();
+        if current_state != self.hotkey_config_state {
+            self.refresh_hotkeys();
+        }
+
+        let pressed = GlobalHotKeyEvent::receiver()
+            .try_iter()
+            .filter(|event| event.state == HotKeyState::Pressed)
+            .filter_map(|event| {
+                self.registered_hotkeys
+                    .iter()
+                    .find(|(hotkey, _)| hotkey.id() == event.id)
+                    .map(|(_, seconds)| *seconds)
+            })
+            .collect::<Vec<_>>();
+        for seconds in pressed {
+            self.save_clip_duration(seconds, false);
+        }
+    }
+
+    fn poll_config_auto_save(&mut self, ctx: &egui::Context) {
+        let Ok(current_state) = serde_json::to_string(&self.config) else {
+            return;
+        };
+        if current_state == self.saved_config_state {
+            self.config_save_due = None;
+            return;
+        }
+
+        let now = Instant::now();
+        let due = *self
+            .config_save_due
+            .get_or_insert_with(|| now + Duration::from_millis(350));
+        if now < due {
+            ctx.request_repaint_after(due - now);
+            return;
+        }
+
+        match self.config.save() {
+            Ok(()) => {
+                self.saved_config_state = current_state;
+                self.config_save_due = None;
+                if let Err(error) = sync_startup_registration(self.config.start_with_windows) {
+                    self.status = format!("Settings saved, but Windows startup failed: {error}");
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not auto-save settings: {error}");
+                self.config_save_due = Some(now + Duration::from_secs(2));
+            }
         }
     }
 
@@ -134,7 +305,7 @@ impl XyraApp {
                 self.audio_devices = devices;
                 sync_audio_device_selection(&mut self.config, &self.audio_devices);
                 self.status = format!(
-                    "Detected {} Windows audio input{}",
+                    "Detected {} Windows audio endpoint{}",
                     self.audio_devices.len(),
                     if self.audio_devices.len() == 1 {
                         ""
@@ -165,12 +336,64 @@ impl XyraApp {
         }
     }
 
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let actions = self
+            .tray
+            .as_ref()
+            .map(SystemTray::drain_actions)
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::ToggleReplayBuffer => self.start_or_stop(),
+                TrayAction::SaveClip => self.save_clip_duration(self.config.clip_seconds, false),
+                TrayAction::Quit => {
+                    self.quit_requested = true;
+                    let _ = self.config.save();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        let running = self.capture.is_running();
+        if let Some(tray) = self.tray.as_mut() {
+            tray.update(running, self.config.clip_seconds);
+        }
+    }
+
+    fn handle_window_close(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested
+            && self.config.minimize_to_tray
+            && self.tray.is_some()
+            && !self.quit_requested
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.status = "Xyra is still running in the system tray".into();
+        }
+    }
+
     fn save_clip(&mut self) {
-        match self.capture.save_replay(&self.config) {
+        self.save_clip_duration(self.config.clip_seconds, true);
+    }
+
+    fn save_clip_duration(&mut self, seconds: u32, open_after_save: bool) {
+        match self.capture.save_replay_duration(&self.config, seconds) {
             Ok(clip) => {
-                self.status = format!("Saved {}", clip.path.display());
+                self.status = format!(
+                    "Saved the previous {} sec to {}",
+                    clip.duration_secs.round() as u32,
+                    clip.path.display()
+                );
                 self.clips.insert(0, clip);
-                self.select_clip(0);
+                if open_after_save {
+                    self.select_clip(0);
+                }
             }
             Err(error) => self.status = error.to_string(),
         }
@@ -832,6 +1055,54 @@ impl XyraApp {
             "Settings",
             "Choose exactly what Xyra records and how it encodes each clip.",
         );
+        ui.label(
+            RichText::new("All changes save automatically.")
+                .size(11.0)
+                .color(SUCCESS),
+        );
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(14)
+            .inner_margin(24)
+            .show(ui, |ui| {
+                section_title(ui, "Windows startup & system tray");
+                ui.label(
+                    RichText::new(
+                        "Keep clipping available in the background without leaving the main window open.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+                ui.checkbox(
+                    &mut self.config.start_with_windows,
+                    RichText::new("Start Xyra with Windows").strong(),
+                );
+                ui.add_space(6.0);
+                ui.add_enabled_ui(self.config.start_with_windows, |ui| {
+                    ui.checkbox(
+                        &mut self.config.start_minimized_on_system_start,
+                        "Start minimized in the system tray on Windows login",
+                    );
+                });
+                ui.add_space(6.0);
+                ui.checkbox(
+                    &mut self.config.minimize_to_tray,
+                    "Closing the window minimizes Xyra to the system tray",
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(
+                        "Tray controls: open Xyra, start or stop the replay buffer, save a clip, or quit completely.",
+                    )
+                    .size(11.0)
+                    .color(CYAN),
+                );
+            });
+
+        ui.add_space(14.0);
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(egui::Stroke::new(1.0, BORDER))
@@ -1073,12 +1344,41 @@ impl XyraApp {
                                 .selected_text(desktop_label)
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
-                                    for device in &self.audio_devices {
+                                    ui.label(
+                                        RichText::new("DESKTOP / LOOPBACK SOURCES")
+                                            .size(10.0)
+                                            .color(CYAN),
+                                    );
+                                    for device in self
+                                        .audio_devices
+                                        .iter()
+                                        .filter(|device| is_desktop_audio_device(device))
+                                    {
                                         ui.selectable_value(
                                             &mut self.config.desktop_audio_device,
                                             Some(device.id.clone()),
                                             &device.name,
                                         );
+                                    }
+                                    let other_devices = self
+                                        .audio_devices
+                                        .iter()
+                                        .filter(|device| !is_desktop_audio_device(device))
+                                        .collect::<Vec<_>>();
+                                    if !other_devices.is_empty() {
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new(
+                                                "OTHER DIRECTSHOW INPUTS (NOT SYSTEM AUDIO)",
+                                            )
+                                            .size(10.0)
+                                            .color(MUTED),
+                                        );
+                                        ui.add_enabled_ui(false, |ui| {
+                                            for device in other_devices {
+                                                ui.label(format!("{}  ·  microphone/input", device.name));
+                                            }
+                                        });
                                     }
                                 });
                         });
@@ -1121,12 +1421,39 @@ impl XyraApp {
                                 .selected_text(microphone_label)
                                 .width(ui.available_width())
                                 .show_ui(ui, |ui| {
-                                    for device in &self.audio_devices {
+                                    ui.label(
+                                        RichText::new("MICROPHONE SOURCES")
+                                            .size(10.0)
+                                            .color(CYAN),
+                                    );
+                                    for device in self
+                                        .audio_devices
+                                        .iter()
+                                        .filter(|device| is_microphone_device(device))
+                                    {
                                         ui.selectable_value(
                                             &mut self.config.microphone_device,
                                             Some(device.id.clone()),
                                             &device.name,
                                         );
+                                    }
+                                    let other_devices = self
+                                        .audio_devices
+                                        .iter()
+                                        .filter(|device| !is_microphone_device(device))
+                                        .collect::<Vec<_>>();
+                                    if !other_devices.is_empty() {
+                                        ui.separator();
+                                        ui.label(
+                                            RichText::new("OTHER DIRECTSHOW INPUTS")
+                                                .size(10.0)
+                                                .color(MUTED),
+                                        );
+                                        ui.add_enabled_ui(false, |ui| {
+                                            for device in other_devices {
+                                                ui.label(format!("{}  ·  desktop/loopback", device.name));
+                                            }
+                                        });
                                     }
                                 });
                         });
@@ -1152,9 +1479,17 @@ impl XyraApp {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{} DirectShow audio input{} detected",
+                            "{} Windows audio endpoint{} detected: {} playback/loopback and {} microphone/input",
                             self.audio_devices.len(),
-                            if self.audio_devices.len() == 1 { "" } else { "s" }
+                            if self.audio_devices.len() == 1 { "" } else { "s" },
+                            self.audio_devices
+                                .iter()
+                                .filter(|device| is_desktop_audio_device(device))
+                                .count(),
+                            self.audio_devices
+                                .iter()
+                                .filter(|device| !is_desktop_audio_device(device))
+                                .count(),
                         ))
                         .size(11.0)
                         .color(if self.audio_devices.is_empty() {
@@ -1167,6 +1502,13 @@ impl XyraApp {
                         self.refresh_audio_devices();
                     }
                 });
+                ui.label(
+                    RichText::new(
+                        "Playback devices use native Windows WASAPI loopback; microphone inputs use DirectShow.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
                 if self.config.desktop_audio_device.is_none() {
                     ui.label(
                         RichText::new(
@@ -1177,6 +1519,9 @@ impl XyraApp {
                     );
                 }
             });
+
+        ui.add_space(14.0);
+        self.hotkeys_settings(ui);
 
         ui.add_space(14.0);
         egui::Frame::new()
@@ -1253,11 +1598,20 @@ impl XyraApp {
                         }
                         match self.config.save() {
                             Ok(()) => {
-                                self.status = if self.ffmpeg_ready {
-                                    "Settings saved. FFmpeg is ready.".into()
-                                } else {
-                                    self.ffmpeg_installer.state().label()
-                                }
+                                self.saved_config_state =
+                                    serde_json::to_string(&self.config).unwrap_or_default();
+                                self.config_save_due = None;
+                                self.status =
+                                    match sync_startup_registration(self.config.start_with_windows)
+                                    {
+                                        Ok(()) if self.ffmpeg_ready => {
+                                            "Settings saved. FFmpeg is ready.".into()
+                                        }
+                                        Ok(()) => self.ffmpeg_installer.state().label(),
+                                        Err(error) => format!(
+                                            "Settings saved, but Windows startup failed: {error}"
+                                        ),
+                                    };
                             }
                             Err(error) => self.status = error.to_string(),
                         }
@@ -1301,12 +1655,136 @@ impl XyraApp {
                 ui.label(RichText::new(&self.status).size(11.0).color(MUTED));
             });
     }
+
+    fn hotkeys_settings(&mut self, ui: &mut egui::Ui) {
+        const KEYS: [&str; 8] = ["F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
+
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(14)
+            .inner_margin(24)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    section_title(ui, "Clip hotkeys");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("+ Add hotkey").clicked()
+                            && self.config.clip_hotkeys.len() < KEYS.len()
+                        {
+                            let key = KEYS
+                                .iter()
+                                .find(|key| {
+                                    !self.config.clip_hotkeys.iter().any(|hotkey| {
+                                        hotkey.modifier == HotkeyModifier::None
+                                            && hotkey.key == **key
+                                    })
+                                })
+                                .copied()
+                                .unwrap_or("F12");
+                            self.config.clip_hotkeys.push(ClipHotkey::new(
+                                key,
+                                HotkeyModifier::None,
+                                self.config.clip_seconds,
+                            ));
+                        }
+                    });
+                });
+                ui.label(
+                    RichText::new(
+                        "Each shortcut saves a different amount of history from the same replay buffer, even while Xyra is in the background.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(14.0);
+
+                let mut remove = None;
+                for (index, hotkey) in self.config.clip_hotkeys.iter_mut().enumerate() {
+                    egui::Frame::new()
+                        .fill(SURFACE_2)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(9)
+                        .inner_margin(12)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut hotkey.enabled, "");
+                                egui::ComboBox::from_id_salt(("hotkey_modifier", index))
+                                    .selected_text(hotkey.modifier.label())
+                                    .width(74.0)
+                                    .show_ui(ui, |ui| {
+                                        for modifier in HotkeyModifier::ALL {
+                                            ui.selectable_value(
+                                                &mut hotkey.modifier,
+                                                modifier,
+                                                modifier.label(),
+                                            );
+                                        }
+                                    });
+                                egui::ComboBox::from_id_salt(("hotkey_key", index))
+                                    .selected_text(&hotkey.key)
+                                    .width(68.0)
+                                    .show_ui(ui, |ui| {
+                                        for key in KEYS {
+                                            ui.selectable_value(
+                                                &mut hotkey.key,
+                                                key.to_owned(),
+                                                key,
+                                            );
+                                        }
+                                    });
+                                ui.label(RichText::new("Save previous").color(MUTED));
+                                ui.add(
+                                    egui::DragValue::new(&mut hotkey.clip_seconds)
+                                        .range(5..=300)
+                                        .speed(1)
+                                        .suffix(" sec"),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove = Some(index);
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(7.0);
+                }
+                if let Some(index) = remove {
+                    self.config.clip_hotkeys.remove(index);
+                }
+
+                ui.label(
+                    RichText::new(&self.hotkey_status)
+                        .size(11.0)
+                        .color(if self.hotkey_status.contains("could not")
+                            || self.hotkey_status.contains("more than once")
+                        {
+                            WARNING
+                        } else {
+                            SUCCESS
+                        }),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Replay history retained: {} sec. Restart a running replay buffer after increasing this value.",
+                        self.config.max_buffer_seconds()
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+    }
 }
 
 impl eframe::App for XyraApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_ffmpeg_install();
         self.poll_player(ui.ctx());
+        self.poll_hotkeys();
+        self.poll_tray(ui.ctx());
+        self.handle_window_close(ui.ctx());
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(ui, |ui| {
@@ -1348,11 +1826,18 @@ impl eframe::App for XyraApp {
                         });
                     });
             });
+        self.poll_config_auto_save(ui.ctx());
         ui.ctx().request_repaint_after(if self.player.is_playing() {
             std::time::Duration::from_millis(16)
         } else {
             std::time::Duration::from_millis(250)
         });
+    }
+}
+
+impl Drop for XyraApp {
+    fn drop(&mut self) {
+        let _ = self.config.save();
     }
 }
 
@@ -1371,11 +1856,21 @@ const WARNING: Color32 = Color32::from_rgb(247, 177, 72);
 const DANGER: Color32 = Color32::from_rgb(205, 65, 82);
 const SIDEBAR_WIDTH: f32 = 212.0;
 
+fn native_hotkey(configured: &ClipHotkey) -> Result<HotKey, String> {
+    let text = match configured.modifier {
+        HotkeyModifier::None => configured.key.clone(),
+        modifier => format!("{}+{}", modifier.label(), configured.key),
+    };
+    text.parse::<HotKey>()
+        .map_err(|error| format!("Invalid hotkey {text}: {error}"))
+}
+
 fn sync_audio_device_selection(config: &mut AppConfig, devices: &[AudioDevice]) {
-    let desktop_is_valid = config
-        .desktop_audio_device
-        .as_ref()
-        .is_some_and(|id| devices.iter().any(|device| &device.id == id));
+    let desktop_is_valid = config.desktop_audio_device.as_ref().is_some_and(|id| {
+        devices
+            .iter()
+            .any(|device| &device.id == id && is_desktop_audio_device(device))
+    });
     if !desktop_is_valid {
         config.desktop_audio_device =
             recommended_desktop_audio(devices).map(|device| device.id.clone());
@@ -1384,10 +1879,11 @@ fn sync_audio_device_selection(config: &mut AppConfig, devices: &[AudioDevice]) 
         }
     }
 
-    let microphone_is_valid = config
-        .microphone_device
-        .as_ref()
-        .is_some_and(|id| devices.iter().any(|device| &device.id == id));
+    let microphone_is_valid = config.microphone_device.as_ref().is_some_and(|id| {
+        devices
+            .iter()
+            .any(|device| &device.id == id && is_microphone_device(device))
+    });
     if !microphone_is_valid {
         config.microphone_device = recommended_microphone(devices).map(|device| device.id.clone());
         if config.microphone_device.is_none() {

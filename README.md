@@ -15,7 +15,13 @@ Xyra is a Windows-first, local-first game clipping desktop app written in Rust. 
 - YouTube: Public, Unlisted, Private
 - Odysee: Public and Unlisted (the service does not offer ordinary private uploads)
 
-## Run it
+## Install it
+
+Download `Xyra-Setup-<version>-x64.exe` from the GitHub Releases page and run the installer. Releases publish the installer and its SHA-256 checksum; the portable application executable is intentionally not published.
+
+The installer uses the current-user Programs folder, adds Xyra to Windows' installed-app list, creates a Start Menu shortcut, offers an optional desktop shortcut, and includes an uninstaller. Administrator access is not required.
+
+## Run it from source
 
 1. Run:
 
@@ -26,7 +32,7 @@ Xyra is a Windows-first, local-first game clipping desktop app written in Rust. 
 2. On first launch, Xyra downloads FFmpeg into its private app-data runtime folder and shows live progress. This is a one-time download.
 3. Click **Start replay buffer**, wait a few seconds, and then click **Save last 30s**.
 
-The first release uses FFmpeg `gdigrab` and software H.264 encoding. A custom FFmpeg path remains available in Settings. Audio capture, GPU encoding, game/window selection, and global hotkeys are the next capture milestone.
+A custom FFmpeg path remains available in Settings for development and troubleshooting.
 
 FFmpeg attribution and redistribution information is in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 

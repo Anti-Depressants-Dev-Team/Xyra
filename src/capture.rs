@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Write,
+    net::{TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
@@ -12,6 +13,7 @@ use crate::{
     config::{AppConfig, EncoderBackend, VideoAspectRatio, VideoCodec},
     display::{MonitorInfo, selected_monitor},
     model::Clip,
+    windows_audio::{LoopbackCapture, wasapi_endpoint_id},
 };
 
 #[derive(Debug, Error)]
@@ -35,6 +37,8 @@ pub enum CaptureError {
 #[derive(Default)]
 pub struct CaptureManager {
     child: Option<Child>,
+    video_child: Option<Child>,
+    loopback: Option<LoopbackCapture>,
 }
 
 impl CaptureManager {
@@ -43,9 +47,24 @@ impl CaptureManager {
             .child
             .as_mut()
             .and_then(|child| child.try_wait().ok().flatten())
-            .is_some();
+            .is_some()
+            || self
+                .video_child
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+                .is_some();
         if finished {
-            self.child = None;
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(mut child) = self.video_child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(mut loopback) = self.loopback.take() {
+                loopback.stop();
+            }
         }
         self.child.is_some()
     }
@@ -75,34 +94,131 @@ impl CaptureManager {
         let monitor = selected_monitor(config.capture_monitor.as_deref()).ok_or_else(|| {
             CaptureError::ProcessFailed("Windows did not report an available display".into())
         })?;
-        let child = Command::new(&config.ffmpeg_path)
-            .args(capture_args(config, &monitor, &output))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(capture_log))
-            .spawn()?;
+        let loopback_endpoint = config
+            .desktop_audio_enabled
+            .then_some(config.desktop_audio_device.as_deref())
+            .flatten()
+            .and_then(wasapi_endpoint_id)
+            .map(str::to_owned);
+        let listener = if loopback_endpoint.is_some() {
+            Some(TcpListener::bind(("127.0.0.1", 0))?)
+        } else {
+            None
+        };
+        let loopback_port = listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|address| address.port());
+        let split_gpu_pipeline = uses_ddagrab(config, &monitor);
+        let (mut child, mut video_child) = if split_gpu_pipeline {
+            let socket = UdpSocket::bind(("127.0.0.1", 0))?;
+            let video_port = socket.local_addr()?.port();
+            drop(socket);
+            let segment_input =
+                format!("udp://127.0.0.1:{video_port}?fifo_size=1000000&overrun_nonfatal=1");
+            let video_output = format!("udp://127.0.0.1:{video_port}?pkt_size=1316");
+            let mut segmenter = Command::new(&config.ffmpeg_path)
+                .args(segmenter_args(
+                    config,
+                    &output,
+                    loopback_port,
+                    &segment_input,
+                ))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(capture_log))
+                .spawn()?;
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let video_log =
+                match fs::File::create(config.buffer_directory.join("video-capture.log")) {
+                    Ok(log) => log,
+                    Err(error) => {
+                        request_child_stop(&mut segmenter);
+                        finish_child(segmenter);
+                        return Err(error.into());
+                    }
+                };
+            let video = match Command::new(&config.ffmpeg_path)
+                .args(gpu_video_capture_args(config, &monitor, &video_output))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(video_log))
+                .spawn()
+            {
+                Ok(video) => video,
+                Err(error) => {
+                    request_child_stop(&mut segmenter);
+                    finish_child(segmenter);
+                    return Err(error.into());
+                }
+            };
+            (segmenter, Some(video))
+        } else {
+            (
+                Command::new(&config.ffmpeg_path)
+                    .args(capture_args_with_loopback(
+                        config,
+                        &monitor,
+                        &output,
+                        loopback_port,
+                    ))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::from(capture_log))
+                    .spawn()?,
+                None,
+            )
+        };
+        if let (Some(endpoint), Some(listener)) = (loopback_endpoint, listener) {
+            match LoopbackCapture::start(endpoint, listener) {
+                Ok(loopback) => self.loopback = Some(loopback),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(video) = video_child.as_mut() {
+                        let _ = video.kill();
+                        let _ = video.wait();
+                    }
+                    return Err(CaptureError::ProcessFailed(error));
+                }
+            }
+        }
         self.child = Some(child);
+        self.video_child = video_child;
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), CaptureError> {
         let mut child = self.child.take().ok_or(CaptureError::NotRunning)?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(b"q\n");
+        request_child_stop(&mut child);
+        if let Some(video) = self.video_child.as_mut() {
+            request_child_stop(video);
         }
-        if child.wait().is_err() {
-            let _ = child.kill();
+        if let Some(mut loopback) = self.loopback.take() {
+            loopback.stop();
+        }
+        finish_child(child);
+        if let Some(video) = self.video_child.take() {
+            finish_child(video);
         }
         Ok(())
     }
 
     pub fn save_replay(&self, config: &AppConfig) -> Result<Clip, CaptureError> {
+        self.save_replay_duration(config, config.clip_seconds)
+    }
+
+    pub fn save_replay_duration(
+        &self,
+        config: &AppConfig,
+        clip_seconds: u32,
+    ) -> Result<Clip, CaptureError> {
         let mut segments = list_segments(&config.buffer_directory)?;
         // FFmpeg may still be writing the newest segment. Only concatenate complete files.
         if self.child.is_some() && !segments.is_empty() {
             segments.pop();
         }
-        let wanted = config.clip_seconds.div_ceil(config.segment_seconds) as usize;
+        let wanted = clip_seconds.max(1).div_ceil(config.segment_seconds) as usize;
         if segments.is_empty() {
             return Err(CaptureError::EmptyBuffer);
         }
@@ -113,7 +229,12 @@ impl CaptureManager {
         let output = config
             .clips_directory
             .join(format!("xyra-{}.mp4", Utc::now().format("%Y%m%d-%H%M%S")));
-        concatenate(&config.ffmpeg_path, &segments, &output)?;
+        concatenate(
+            &config.ffmpeg_path,
+            &segments,
+            &output,
+            config.segment_seconds,
+        )?;
         Ok(Clip::new(
             output,
             (segments.len() as u32 * config.segment_seconds) as f32,
@@ -159,25 +280,52 @@ impl CaptureManager {
 
 impl Drop for CaptureManager {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut()
-            && let Some(stdin) = child.stdin.as_mut()
-        {
-            let _ = stdin.write_all(b"q\n");
+        if let Some(mut loopback) = self.loopback.take() {
+            loopback.stop();
+        }
+        if let Some(mut child) = self.child.take() {
+            request_child_stop(&mut child);
+            finish_child(child);
+        }
+        if let Some(mut child) = self.video_child.take() {
+            request_child_stop(&mut child);
+            finish_child(child);
         }
     }
 }
 
+fn request_child_stop(child: &mut Child) {
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"q\n");
+    }
+}
+
+fn finish_child(mut child: Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().is_ok_and(|status| status.is_some()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(test)]
 fn capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &Path) -> Vec<String> {
+    capture_args_with_loopback(config, monitor, output, None)
+}
+
+fn capture_args_with_loopback(
+    config: &AppConfig,
+    monitor: &MonitorInfo,
+    output: &Path,
+    loopback_port: Option<u16>,
+) -> Vec<String> {
     let output_width = config.output_width.max(640) / 2 * 2;
     let output_height = config.output_height.max(360) / 2 * 2;
-    let use_ddagrab = cfg!(windows)
-        && config.encoder == EncoderBackend::Nvidia
-        && output_width == monitor.width
-        && output_height == monitor.height
-        && matches!(
-            config.video_aspect_ratio,
-            VideoAspectRatio::Stretch16By9 | VideoAspectRatio::Game
-        );
+    let use_ddagrab = uses_ddagrab(config, monitor);
     let codec = match (config.encoder, config.video_codec) {
         (EncoderBackend::Software, VideoCodec::H264) => "libx264",
         (EncoderBackend::Software, VideoCodec::H265) => "libx265",
@@ -192,6 +340,9 @@ fn capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &Path) -> Vec
         "-hide_banner".into(),
         "-loglevel".into(),
         "warning".into(),
+        "-stats_period".into(),
+        "30".into(),
+        "-stats".into(),
         "-y".into(),
     ];
     if use_ddagrab {
@@ -224,18 +375,7 @@ fn capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &Path) -> Vec
     }
     let audio_sources = audio_sources(config);
     for source in &audio_sources {
-        args.extend([
-            "-thread_queue_size".into(),
-            "1024".into(),
-            "-use_wallclock_as_timestamps".into(),
-            "1".into(),
-            "-f".into(),
-            "dshow".into(),
-            "-audio_buffer_size".into(),
-            "50".into(),
-            "-i".into(),
-            format!("audio={}", source.device),
-        ]);
+        append_audio_input_args(&mut args, source, loopback_port);
     }
     if !use_ddagrab {
         args.extend([
@@ -291,12 +431,173 @@ fn capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &Path) -> Vec
         "-segment_time".into(),
         config.segment_seconds.to_string(),
         "-segment_wrap".into(),
-        (config.clip_seconds.div_ceil(config.segment_seconds) + 3).to_string(),
+        (config.max_buffer_seconds().div_ceil(config.segment_seconds) + 3).to_string(),
         "-reset_timestamps".into(),
         "1".into(),
         output.display().to_string(),
     ]);
     args
+}
+
+fn uses_ddagrab(config: &AppConfig, monitor: &MonitorInfo) -> bool {
+    let output_width = config.output_width.max(640) / 2 * 2;
+    let output_height = config.output_height.max(360) / 2 * 2;
+    cfg!(windows)
+        && config.encoder == EncoderBackend::Nvidia
+        && output_width == monitor.width
+        && output_height == monitor.height
+        && matches!(
+            config.video_aspect_ratio,
+            VideoAspectRatio::Stretch16By9 | VideoAspectRatio::Game
+        )
+}
+
+fn gpu_video_capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &str) -> Vec<String> {
+    let codec = match config.video_codec {
+        VideoCodec::H264 => "h264_nvenc",
+        VideoCodec::H265 => "hevc_nvenc",
+    };
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "warning".into(),
+        "-stats_period".into(),
+        "30".into(),
+        "-stats".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        format!(
+            "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1",
+            monitor.output_index, config.frame_rate
+        ),
+        "-c:v".into(),
+        codec.into(),
+        "-preset".into(),
+        "p1".into(),
+        "-tune".into(),
+        "ull".into(),
+        "-rc".into(),
+        "cbr".into(),
+        "-multipass".into(),
+        "disabled".into(),
+        "-rc-lookahead".into(),
+        "0".into(),
+        "-bf".into(),
+        "0".into(),
+        "-zerolatency".into(),
+        "1".into(),
+        "-delay".into(),
+        "0".into(),
+        "-forced-idr".into(),
+        "1".into(),
+        "-b:v".into(),
+        format!("{}M", config.video_bitrate_mbps),
+        "-maxrate".into(),
+        format!("{}M", config.video_bitrate_mbps),
+        "-bufsize".into(),
+        format!("{}M", config.video_bitrate_mbps.saturating_mul(2)),
+        "-g".into(),
+        config
+            .frame_rate
+            .saturating_mul(config.segment_seconds)
+            .to_string(),
+        "-fps_mode".into(),
+        "cfr".into(),
+        "-force_key_frames".into(),
+        format!("expr:gte(t,n_forced*{})", config.segment_seconds),
+        "-an".into(),
+        "-f".into(),
+        "mpegts".into(),
+        "-mpegts_copyts".into(),
+        "1".into(),
+        "-muxdelay".into(),
+        "0".into(),
+        "-muxpreload".into(),
+        "0".into(),
+        "-flush_packets".into(),
+        "1".into(),
+        output.into(),
+    ]
+}
+
+fn segmenter_args(
+    config: &AppConfig,
+    output: &Path,
+    loopback_port: Option<u16>,
+    video_input: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "warning".into(),
+        "-stats_period".into(),
+        "30".into(),
+        "-stats".into(),
+        "-y".into(),
+        "-thread_queue_size".into(),
+        "4096".into(),
+        "-fflags".into(),
+        "+genpts".into(),
+        "-i".into(),
+        video_input.into(),
+    ];
+    let audio_sources = audio_sources(config);
+    for source in &audio_sources {
+        append_audio_input_args(&mut args, source, loopback_port);
+    }
+    append_audio_output_args(&mut args, config, &audio_sources);
+    args.extend([
+        "-c:v".into(),
+        "copy".into(),
+        "-f".into(),
+        "segment".into(),
+        "-segment_time".into(),
+        config.segment_seconds.to_string(),
+        "-segment_wrap".into(),
+        (config.max_buffer_seconds().div_ceil(config.segment_seconds) + 3).to_string(),
+        "-reset_timestamps".into(),
+        "1".into(),
+        output.display().to_string(),
+    ]);
+    args
+}
+
+fn append_audio_input_args(
+    args: &mut Vec<String>,
+    source: &AudioSource<'_>,
+    loopback_port: Option<u16>,
+) {
+    if matches!(source.kind, AudioSourceKind::Desktop)
+        && wasapi_endpoint_id(source.device).is_some()
+    {
+        args.extend([
+            "-thread_queue_size".into(),
+            "1024".into(),
+            "-f".into(),
+            "f32le".into(),
+            "-ar".into(),
+            "48000".into(),
+            "-ac".into(),
+            "2".into(),
+            "-i".into(),
+            format!("tcp://127.0.0.1:{}", loopback_port.unwrap_or_default()),
+        ]);
+    } else {
+        args.extend([
+            "-thread_queue_size".into(),
+            "1024".into(),
+            "-use_wallclock_as_timestamps".into(),
+            "1".into(),
+            "-f".into(),
+            "dshow".into(),
+            "-audio_buffer_size".into(),
+            "50".into(),
+            "-i".into(),
+            format!("audio={}", source.device),
+        ]);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -501,21 +802,14 @@ fn clear_segments(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn concatenate(ffmpeg: &Path, segments: &[PathBuf], output: &Path) -> Result<(), CaptureError> {
+fn concatenate(
+    ffmpeg: &Path,
+    segments: &[PathBuf],
+    output: &Path,
+    segment_seconds: u32,
+) -> Result<(), CaptureError> {
     let list_path = output.with_extension("concat.txt");
-    let list = segments
-        .iter()
-        .map(|path| {
-            format!(
-                "file '{}'",
-                path.display()
-                    .to_string()
-                    .replace('\\', "/")
-                    .replace('\'', "'\\''")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let list = concat_list(segments, segment_seconds);
     fs::write(&list_path, list)?;
     let result = Command::new(ffmpeg)
         .args(["-y", "-f", "concat", "-safe", "0", "-i"])
@@ -535,6 +829,28 @@ fn concatenate(ffmpeg: &Path, segments: &[PathBuf], output: &Path) -> Result<(),
         ));
     }
     Ok(())
+}
+
+fn concat_list(segments: &[PathBuf], segment_seconds: u32) -> String {
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let file = format!(
+                "file '{}'",
+                path.display()
+                    .to_string()
+                    .replace('\\', "/")
+                    .replace('\'', "'\\''")
+            );
+            if index + 1 < segments.len() {
+                format!("{file}\nduration {segment_seconds}.000000")
+            } else {
+                file
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -557,11 +873,26 @@ mod tests {
         let args = capture_args(&config, &monitor, Path::new("buffer.mp4"));
         let joined = args.join(" ");
         assert!(joined.contains("-segment_time 2"));
-        assert!(joined.contains("-segment_wrap 18"));
+        assert!(joined.contains(&format!(
+            "-segment_wrap {}",
+            config.max_buffer_seconds().div_ceil(config.segment_seconds) + 3
+        )));
         assert!(joined.contains("gdigrab"));
         assert!(joined.contains("-offset_x -1920"));
         assert!(joined.contains("-video_size 1920x1080"));
         assert!(joined.contains("-c:v libx264"));
+    }
+
+    #[test]
+    fn concat_list_uses_the_exact_capture_clock() {
+        let list = concat_list(
+            &[
+                PathBuf::from("segment-1.mp4"),
+                PathBuf::from("segment-2.mp4"),
+            ],
+            2,
+        );
+        assert_eq!(list.matches("duration 2.000000").count(), 1);
     }
 
     #[test]
@@ -656,6 +987,74 @@ mod tests {
         assert!(joined.contains("afftdn=nf=-25,pan=stereo|c0=c0|c1=c0,volume=0.60"));
         assert!(joined.contains("amix=inputs=2"));
         assert!(joined.contains("-map [audio_mix] -c:a aac -b:a 192k"));
+    }
+
+    #[test]
+    fn capture_accepts_native_wasapi_playback_audio() {
+        let config = AppConfig {
+            desktop_audio_enabled: true,
+            desktop_audio_device: Some("wasapi-render:windows-endpoint".into()),
+            microphone_enabled: false,
+            ..AppConfig::default()
+        };
+        let monitor = MonitorInfo {
+            output_index: 0,
+            id: "display1".into(),
+            label: "Display 1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+        let joined =
+            capture_args_with_loopback(&config, &monitor, Path::new("buffer.mp4"), Some(43123))
+                .join(" ");
+        assert!(joined.contains("-f f32le -ar 48000 -ac 2"));
+        assert!(joined.contains("tcp://127.0.0.1:43123"));
+        assert!(!joined.contains("audio=wasapi-render"));
+    }
+
+    #[test]
+    fn split_gpu_capture_keeps_desktop_grab_separate_from_audio_and_segments() {
+        let config = AppConfig {
+            encoder: EncoderBackend::Nvidia,
+            video_codec: VideoCodec::H264,
+            output_width: 1920,
+            output_height: 1080,
+            frame_rate: 60,
+            desktop_audio_enabled: true,
+            desktop_audio_device: Some("wasapi-render:windows-endpoint".into()),
+            ..AppConfig::default()
+        };
+        let monitor = MonitorInfo {
+            output_index: 0,
+            id: "display1".into(),
+            label: "Display 1".into(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+
+        let video = gpu_video_capture_args(&config, &monitor, "udp://127.0.0.1:43123").join(" ");
+        assert!(video.contains("ddagrab=output_idx=0:framerate=60"));
+        assert!(video.contains("-c:v h264_nvenc -preset p1 -tune ull"));
+        assert!(video.contains("-rc-lookahead 0 -bf 0 -zerolatency 1"));
+        assert!(!video.contains("dshow"));
+
+        let segmenter = segmenter_args(
+            &config,
+            Path::new("buffer-%03d.mp4"),
+            Some(43124),
+            "udp://127.0.0.1:43123",
+        )
+        .join(" ");
+        assert!(segmenter.contains("-c:v copy"));
+        assert!(segmenter.contains("-f segment -segment_time"));
+        assert!(segmenter.contains("tcp://127.0.0.1:43124"));
+        assert!(!segmenter.contains("h264_nvenc"));
     }
 
     #[test]

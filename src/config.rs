@@ -83,6 +83,55 @@ pub enum VideoAspectRatio {
     Crop16By9,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipHotkey {
+    pub enabled: bool,
+    pub key: String,
+    pub modifier: HotkeyModifier,
+    pub clip_seconds: u32,
+}
+
+impl ClipHotkey {
+    pub fn new(key: impl Into<String>, modifier: HotkeyModifier, clip_seconds: u32) -> Self {
+        Self {
+            enabled: true,
+            key: key.into(),
+            modifier,
+            clip_seconds,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        let key = if self.modifier == HotkeyModifier::None {
+            self.key.clone()
+        } else {
+            format!("{} + {}", self.modifier.label(), self.key)
+        };
+        format!("{key} saves the previous {} sec", self.clip_seconds)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HotkeyModifier {
+    None,
+    Control,
+    Alt,
+    Shift,
+}
+
+impl HotkeyModifier {
+    pub const ALL: [Self; 4] = [Self::None, Self::Control, Self::Alt, Self::Shift];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Control => "Ctrl",
+            Self::Alt => "Alt",
+            Self::Shift => "Shift",
+        }
+    }
+}
+
 impl VideoAspectRatio {
     pub const ALL: [Self; 4] = [
         Self::Stretch16By9,
@@ -126,7 +175,11 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct AppConfig {
     pub ffmpeg_path: PathBuf,
+    pub start_with_windows: bool,
+    pub start_minimized_on_system_start: bool,
+    pub minimize_to_tray: bool,
     pub clip_seconds: u32,
+    pub clip_hotkeys: Vec<ClipHotkey>,
     pub segment_seconds: u32,
     pub frame_rate: u32,
     pub quality: CaptureQuality,
@@ -159,7 +212,15 @@ impl Default for AppConfig {
             .unwrap_or_else(|| PathBuf::from(".xyra"));
         Self {
             ffmpeg_path: managed_ffmpeg_path_from(&base),
+            start_with_windows: false,
+            start_minimized_on_system_start: true,
+            minimize_to_tray: true,
             clip_seconds: 30,
+            clip_hotkeys: vec![
+                ClipHotkey::new("F8", HotkeyModifier::None, 30),
+                ClipHotkey::new("F7", HotkeyModifier::None, 60),
+                ClipHotkey::new("F6", HotkeyModifier::None, 120),
+            ],
             segment_seconds: 2,
             frame_rate: 60,
             quality: CaptureQuality::High,
@@ -187,6 +248,17 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn max_buffer_seconds(&self) -> u32 {
+        self.clip_hotkeys
+            .iter()
+            .filter(|hotkey| hotkey.enabled)
+            .map(|hotkey| hotkey.clip_seconds)
+            .chain(std::iter::once(self.clip_seconds))
+            .max()
+            .unwrap_or(self.clip_seconds)
+            .max(5)
+    }
+
     pub fn apply_quality(&mut self, quality: CaptureQuality) {
         self.quality = quality;
         match quality {
@@ -279,5 +351,17 @@ mod tests {
         assert_eq!((config.output_width, config.output_height), (1920, 1080));
         assert_eq!(config.frame_rate, 60);
         assert_eq!(config.video_bitrate_mbps, 12);
+    }
+
+    #[test]
+    fn longest_enabled_hotkey_controls_buffer_length() {
+        let mut config = AppConfig {
+            clip_seconds: 30,
+            ..AppConfig::default()
+        };
+        config.clip_hotkeys[2].clip_seconds = 180;
+        assert_eq!(config.max_buffer_seconds(), 180);
+        config.clip_hotkeys[2].enabled = false;
+        assert_eq!(config.max_buffer_seconds(), 60);
     }
 }
