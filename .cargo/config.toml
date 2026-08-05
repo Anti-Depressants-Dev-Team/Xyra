@@ -1,0 +1,2 @@
+[target.'cfg(windows)']
+runner = ["powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/run-with-obs.ps1"]
