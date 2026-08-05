@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $obsDll -PathType Leaf) -or
 }
 
 $env:XYRA_OBS_RUNTIME = $runtime
-$env:PATH = "$runtime;$env:PATH"
+$env:PATH = "$env:PATH;$runtime"
 
 $processArguments = @{}
 if ($null -ne $RemainingArguments -and $RemainingArguments.Length -gt 0) {
