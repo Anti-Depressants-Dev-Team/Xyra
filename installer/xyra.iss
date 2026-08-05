@@ -7,6 +7,9 @@
 #ifndef SourceExe
   #define SourceExe "..\target\release\xyra.exe"
 #endif
+#ifndef ObsRuntimeDir
+  #define ObsRuntimeDir "..\obs-runtime"
+#endif
 
 #define MyAppName "Xyra"
 #define MyAppPublisher "Anti Depressants Dev Team"
@@ -53,7 +56,9 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+Source: "{#ObsRuntimeDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "..\licenses\GPL-3.0.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; DestName: "THIRD_PARTY_NOTICES.txt"; Flags: ignoreversion
 
 [Icons]

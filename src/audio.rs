@@ -1,6 +1,12 @@
-use std::{path::Path, process::Command};
+use std::path::Path;
 
-use crate::windows_audio::{WASAPI_RENDER_PREFIX, enumerate_render_devices};
+use crate::{
+    process::hidden_command,
+    windows_audio::{
+        WASAPI_CAPTURE_PREFIX, WASAPI_RENDER_PREFIX, enumerate_capture_devices,
+        enumerate_render_devices,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDevice {
@@ -9,7 +15,7 @@ pub struct AudioDevice {
 }
 
 pub fn enumerate_audio_devices(ffmpeg: &Path) -> std::io::Result<Vec<AudioDevice>> {
-    let output = Command::new(ffmpeg)
+    let output = hidden_command(ffmpeg)
         .args([
             "-hide_banner",
             "-list_devices",
@@ -21,6 +27,7 @@ pub fn enumerate_audio_devices(ffmpeg: &Path) -> std::io::Result<Vec<AudioDevice
         ])
         .output()?;
     let mut devices = enumerate_render_devices().unwrap_or_default();
+    devices.extend(enumerate_capture_devices().unwrap_or_default());
     devices.extend(parse_dshow_devices(&String::from_utf8_lossy(
         &output.stderr,
     )));
@@ -63,6 +70,9 @@ pub fn is_desktop_audio_device(device: &AudioDevice) -> bool {
 }
 
 pub fn is_microphone_device(device: &AudioDevice) -> bool {
+    if device.id.starts_with(WASAPI_CAPTURE_PREFIX) {
+        return true;
+    }
     let name = device.name.to_ascii_lowercase();
     !is_desktop_audio_device(device)
         && (name.contains("microphone")

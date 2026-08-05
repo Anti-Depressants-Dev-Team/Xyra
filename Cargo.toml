@@ -1,12 +1,13 @@
 [package]
 name = "xyra"
-version = "0.1.0-alpha"
+version = "1.5.0-alpha"
 edition = "2024"
 description = "A local-first game clipping, editing, and publishing desktop app"
-license = "MIT"
+license = "GPL-2.0-or-later"
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
+base64 = "0.22.1"
 directories = "6.0.0"
 eframe = { version = "0.35.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.35.0"
@@ -14,15 +15,21 @@ ffmpeg-sidecar = "2.5.2"
 global-hotkey = "0.8.0"
 open = "5.3.2"
 rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
+sha2 = "0.10.9"
 thiserror = "2.0.19"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+url = "2.5.7"
 
 [target.'cfg(windows)'.dependencies]
+libobs = "=5.0.1"
+libobs-simple = { version = "=8.0.1", default-features = false, features = ["enable_runtime"] }
+libobs-wrapper = { version = "=9.0.4", default-features = false, features = ["enable_runtime"] }
 tray-icon = "0.24.1"
 wasapi = "0.23.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Credentials", "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 lto = "thin"

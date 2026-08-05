@@ -7,6 +7,37 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::model::{Platform, PublishTarget};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CaptureEngine {
+    Auto,
+    Obs,
+    Ffmpeg,
+}
+
+impl CaptureEngine {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Obs, Self::Ffmpeg];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Automatic (OBS preferred)",
+            Self::Obs => "OBS engine",
+            Self::Ffmpeg => "Legacy FFmpeg",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Auto => {
+                "Uses the bundled OBS engine and falls back to FFmpeg if OBS cannot start."
+            }
+            Self::Obs => "GPU-native OBS capture, audio mixing, encoding, and replay buffering.",
+            Self::Ffmpeg => "Compatibility backend retained for troubleshooting.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CaptureQuality {
     Low,
@@ -39,6 +70,7 @@ impl CaptureQuality {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EncoderBackend {
+    Auto,
     Software,
     Nvidia,
     Amd,
@@ -46,10 +78,17 @@ pub enum EncoderBackend {
 }
 
 impl EncoderBackend {
-    pub const ALL: [Self; 4] = [Self::Software, Self::Nvidia, Self::Amd, Self::Intel];
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Nvidia,
+        Self::Amd,
+        Self::Intel,
+        Self::Software,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Auto => "Automatic (recommended)",
             Self::Software => "CPU (software)",
             Self::Nvidia => "NVIDIA NVENC",
             Self::Amd => "AMD AMF",
@@ -174,6 +213,8 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
+    pub config_version: u32,
+    pub capture_engine: CaptureEngine,
     pub ffmpeg_path: PathBuf,
     pub start_with_windows: bool,
     pub start_minimized_on_system_start: bool,
@@ -189,6 +230,8 @@ pub struct AppConfig {
     pub video_bitrate_mbps: u32,
     pub output_width: u32,
     pub output_height: u32,
+    pub capture_cursor: bool,
+    pub animated_cursor_compatibility: bool,
     /// Windows display device name, such as `\\.\DISPLAY1`. None selects the primary display.
     pub capture_monitor: Option<String>,
     pub desktop_audio_enabled: bool,
@@ -203,6 +246,11 @@ pub struct AppConfig {
     pub clips_directory: PathBuf,
     pub buffer_directory: PathBuf,
     pub auto_queue_after_clip: bool,
+    pub publish_targets: Vec<PublishTarget>,
+    pub youtube_client_id: String,
+    pub odysee_api_url: String,
+    pub odysee_bid: String,
+    pub odysee_channel_id: String,
 }
 
 impl Default for AppConfig {
@@ -211,6 +259,8 @@ impl Default for AppConfig {
             .map(|dirs| dirs.data_local_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from(".xyra"));
         Self {
+            config_version: 3,
+            capture_engine: CaptureEngine::Auto,
             ffmpeg_path: managed_ffmpeg_path_from(&base),
             start_with_windows: false,
             start_minimized_on_system_start: true,
@@ -223,13 +273,15 @@ impl Default for AppConfig {
             ],
             segment_seconds: 2,
             frame_rate: 60,
-            quality: CaptureQuality::High,
-            encoder: EncoderBackend::Software,
+            quality: CaptureQuality::Standard,
+            encoder: EncoderBackend::Auto,
             video_codec: VideoCodec::H264,
             video_aspect_ratio: VideoAspectRatio::Stretch16By9,
-            video_bitrate_mbps: 24,
+            video_bitrate_mbps: 12,
             output_width: 1920,
             output_height: 1080,
+            capture_cursor: true,
+            animated_cursor_compatibility: false,
             capture_monitor: None,
             desktop_audio_enabled: true,
             desktop_audio_device: None,
@@ -243,6 +295,11 @@ impl Default for AppConfig {
             clips_directory: base.join("clips"),
             buffer_directory: base.join("buffer"),
             auto_queue_after_clip: false,
+            publish_targets: Platform::ALL.into_iter().map(PublishTarget::new).collect(),
+            youtube_client_id: String::new(),
+            odysee_api_url: "http://127.0.0.1:5279".into(),
+            odysee_bid: "0.01".into(),
+            odysee_channel_id: String::new(),
         }
     }
 }
@@ -289,7 +346,25 @@ impl AppConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let mut config: Self = serde_json::from_slice(&fs::read(path)?)?;
+        let bytes = fs::read(path)?;
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let mut config: Self = serde_json::from_slice(&bytes)?;
+        // The first alpha defaulted to CPU encoding even on systems with a
+        // dedicated encoder. Migrate only those unversioned configs; explicit
+        // choices made after automatic detection was added remain untouched.
+        if raw.get("config_version").is_none() {
+            if config.encoder == EncoderBackend::Software {
+                config.encoder = EncoderBackend::Auto;
+            }
+            config.config_version = 2;
+        }
+        if config.config_version < 3 {
+            config.capture_engine = CaptureEngine::Auto;
+            config.config_version = 3;
+        }
+        config.frame_rate = config.frame_rate.clamp(24, 120);
+        config.video_bitrate_mbps = config.video_bitrate_mbps.clamp(2, 100);
+        config.segment_seconds = config.segment_seconds.clamp(1, 10);
         // Migrate early Xyra installs that expected FFmpeg to exist on PATH.
         if config.ffmpeg_path == Path::new("ffmpeg")
             || config.ffmpeg_path == Path::new("ffmpeg.exe")

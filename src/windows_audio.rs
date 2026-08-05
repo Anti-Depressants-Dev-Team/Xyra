@@ -3,6 +3,7 @@ use std::{io, net::TcpListener};
 use crate::audio::AudioDevice;
 
 pub const WASAPI_RENDER_PREFIX: &str = "wasapi-render:";
+pub const WASAPI_CAPTURE_PREFIX: &str = "wasapi-capture:";
 
 pub fn is_wasapi_render_id(id: &str) -> bool {
     id.starts_with(WASAPI_RENDER_PREFIX)
@@ -12,12 +13,26 @@ pub fn wasapi_endpoint_id(id: &str) -> Option<&str> {
     id.strip_prefix(WASAPI_RENDER_PREFIX)
 }
 
+pub fn wasapi_capture_endpoint_id(id: &str) -> Option<&str> {
+    id.strip_prefix(WASAPI_CAPTURE_PREFIX)
+}
+
 #[cfg(windows)]
 pub fn enumerate_render_devices() -> io::Result<Vec<AudioDevice>> {
-    std::thread::spawn(enumerate_render_devices_inner)
+    std::thread::spawn(|| enumerate_devices_inner(wasapi::Direction::Render, WASAPI_RENDER_PREFIX))
         .join()
         .map_err(|_| io::Error::other("WASAPI device scan thread panicked"))?
         .map_err(io::Error::other)
+}
+
+#[cfg(windows)]
+pub fn enumerate_capture_devices() -> io::Result<Vec<AudioDevice>> {
+    std::thread::spawn(|| {
+        enumerate_devices_inner(wasapi::Direction::Capture, WASAPI_CAPTURE_PREFIX)
+    })
+    .join()
+    .map_err(|_| io::Error::other("WASAPI microphone scan thread panicked"))?
+    .map_err(io::Error::other)
 }
 
 #[cfg(not(windows))]
@@ -25,18 +40,26 @@ pub fn enumerate_render_devices() -> io::Result<Vec<AudioDevice>> {
     Ok(Vec::new())
 }
 
+#[cfg(not(windows))]
+pub fn enumerate_capture_devices() -> io::Result<Vec<AudioDevice>> {
+    Ok(Vec::new())
+}
+
 #[cfg(windows)]
-fn enumerate_render_devices_inner() -> Result<Vec<AudioDevice>, String> {
-    use wasapi::{DeviceEnumerator, Direction, initialize_mta};
+fn enumerate_devices_inner(
+    direction: wasapi::Direction,
+    id_prefix: &str,
+) -> Result<Vec<AudioDevice>, String> {
+    use wasapi::{DeviceEnumerator, initialize_mta};
 
     initialize_mta().ok().map_err(|error| error.to_string())?;
     let enumerator = DeviceEnumerator::new().map_err(|error| error.to_string())?;
     let default_id = enumerator
-        .get_default_device(&Direction::Render)
+        .get_default_device(&direction)
         .and_then(|device| device.get_id())
         .ok();
     let collection = enumerator
-        .get_device_collection(&Direction::Render)
+        .get_device_collection(&direction)
         .map_err(|error| error.to_string())?;
     let mut devices = collection
         .into_iter()
@@ -49,14 +72,15 @@ fn enumerate_render_devices_inner() -> Result<Vec<AudioDevice>, String> {
             }
             Some(AudioDevice {
                 name,
-                id: format!("{WASAPI_RENDER_PREFIX}{id}"),
+                id: format!("{id_prefix}{id}"),
             })
         })
         .collect::<Vec<_>>();
     devices.sort_by_key(|device| {
-        if default_id.as_ref().is_some_and(|default| {
-            device.id.strip_prefix(WASAPI_RENDER_PREFIX) == Some(default.as_str())
-        }) {
+        if default_id
+            .as_ref()
+            .is_some_and(|default| device.id.strip_prefix(id_prefix) == Some(default.as_str()))
+        {
             0
         } else {
             1

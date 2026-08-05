@@ -1,18 +1,20 @@
 use std::{
     fs,
     io::Write,
-    net::{TcpListener, UdpSocket},
+    net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
 };
 
 use chrono::Utc;
 use thiserror::Error;
 
 use crate::{
-    config::{AppConfig, EncoderBackend, VideoAspectRatio, VideoCodec},
+    config::{AppConfig, CaptureEngine, EncoderBackend, VideoAspectRatio, VideoCodec},
     display::{MonitorInfo, selected_monitor},
     model::Clip,
+    obs_capture::{ObsCaptureEngine, ObsReplayRequest},
+    process::hidden_command,
     windows_audio::{LoopbackCapture, wasapi_endpoint_id},
 };
 
@@ -28,6 +30,10 @@ pub enum CaptureError {
     NotRunning,
     #[error("not enough buffered video yet; wait a few seconds")]
     EmptyBuffer,
+    #[error("{0} is not available in the bundled FFmpeg build or graphics driver")]
+    EncoderUnavailable(&'static str),
+    #[error("OBS capture failed: {0}")]
+    Obs(String),
     #[error("media operation failed: {0}")]
     ProcessFailed(String),
     #[error("file operation failed: {0}")]
@@ -36,41 +42,65 @@ pub enum CaptureError {
 
 #[derive(Default)]
 pub struct CaptureManager {
+    obs: Option<ObsCaptureEngine>,
     child: Option<Child>,
-    video_child: Option<Child>,
     loopback: Option<LoopbackCapture>,
+    active_encoder: Option<EncoderBackend>,
+}
+
+pub enum ReplaySaveRequest {
+    Obs(ObsReplayRequest),
+    Ffmpeg {
+        config: AppConfig,
+        clip_seconds: u32,
+        capture_running: bool,
+    },
+}
+
+impl ReplaySaveRequest {
+    pub fn complete(self) -> Result<Clip, CaptureError> {
+        match self {
+            Self::Obs(request) => request
+                .complete()
+                .map_err(|error| CaptureError::Obs(error.to_string())),
+            Self::Ffmpeg {
+                config,
+                clip_seconds,
+                capture_running,
+            } => CaptureManager::save_replay_snapshot(&config, clip_seconds, capture_running),
+        }
+    }
 }
 
 impl CaptureManager {
     pub fn is_running(&mut self) -> bool {
+        if let Some(obs) = self.obs.as_ref() {
+            if obs.is_running() {
+                return true;
+            }
+            self.obs = None;
+            self.active_encoder = None;
+        }
         let finished = self
             .child
             .as_mut()
             .and_then(|child| child.try_wait().ok().flatten())
-            .is_some()
-            || self
-                .video_child
-                .as_mut()
-                .and_then(|child| child.try_wait().ok().flatten())
-                .is_some();
+            .is_some();
         if finished {
             if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Some(mut child) = self.video_child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
             if let Some(mut loopback) = self.loopback.take() {
                 loopback.stop();
             }
+            self.active_encoder = None;
         }
         self.child.is_some()
     }
 
     pub fn ffmpeg_available(config: &AppConfig) -> bool {
-        Command::new(&config.ffmpeg_path)
+        hidden_command(&config.ffmpeg_path)
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -82,21 +112,50 @@ impl CaptureManager {
         if self.is_running() {
             return Err(CaptureError::AlreadyRunning);
         }
+        if matches!(
+            config.capture_engine,
+            CaptureEngine::Auto | CaptureEngine::Obs
+        ) {
+            match ObsCaptureEngine::start(config) {
+                Ok(obs) => {
+                    self.active_encoder = Some(obs.active_encoder());
+                    self.obs = Some(obs);
+                    return Ok(());
+                }
+                Err(error) if config.capture_engine == CaptureEngine::Auto => {
+                    eprintln!(
+                        "OBS engine could not start; using FFmpeg compatibility mode: {error}"
+                    );
+                }
+                Err(error) => return Err(CaptureError::Obs(error.to_string())),
+            }
+        }
+        self.start_ffmpeg(config)
+    }
+
+    fn start_ffmpeg(&mut self, config: &AppConfig) -> Result<(), CaptureError> {
         if !Self::ffmpeg_available(config) {
             return Err(CaptureError::FfmpegMissing(
                 config.ffmpeg_path.display().to_string(),
             ));
         }
-        fs::create_dir_all(&config.buffer_directory)?;
-        clear_segments(&config.buffer_directory)?;
-        let output = config.buffer_directory.join("segment-%06d.mp4");
-        let capture_log = fs::File::create(config.buffer_directory.join("capture.log"))?;
-        let monitor = selected_monitor(config.capture_monitor.as_deref()).ok_or_else(|| {
-            CaptureError::ProcessFailed("Windows did not report an available display".into())
-        })?;
-        let loopback_endpoint = config
+        let mut capture_config = config.clone();
+        capture_config.encoder = match config.encoder {
+            EncoderBackend::Auto => Self::detect_encoder(&config.ffmpeg_path),
+            requested if encoder_available(&config.ffmpeg_path, requested) => requested,
+            requested => return Err(CaptureError::EncoderUnavailable(requested.label())),
+        };
+        fs::create_dir_all(&capture_config.buffer_directory)?;
+        clear_segments(&capture_config.buffer_directory)?;
+        let output = capture_config.buffer_directory.join("segment-%06d.mp4");
+        let capture_log = fs::File::create(capture_config.buffer_directory.join("capture.log"))?;
+        let monitor =
+            selected_monitor(capture_config.capture_monitor.as_deref()).ok_or_else(|| {
+                CaptureError::ProcessFailed("Windows did not report an available display".into())
+            })?;
+        let loopback_endpoint = capture_config
             .desktop_audio_enabled
-            .then_some(config.desktop_audio_device.as_deref())
+            .then_some(capture_config.desktop_audio_device.as_deref())
             .flatten()
             .and_then(wasapi_endpoint_id)
             .map(str::to_owned);
@@ -109,99 +168,93 @@ impl CaptureManager {
             .as_ref()
             .and_then(|listener| listener.local_addr().ok())
             .map(|address| address.port());
-        let split_gpu_pipeline = uses_ddagrab(config, &monitor);
-        let (mut child, mut video_child) = if split_gpu_pipeline {
-            let socket = UdpSocket::bind(("127.0.0.1", 0))?;
-            let video_port = socket.local_addr()?.port();
-            drop(socket);
-            let segment_input =
-                format!("udp://127.0.0.1:{video_port}?fifo_size=1000000&overrun_nonfatal=1");
-            let video_output = format!("udp://127.0.0.1:{video_port}?pkt_size=1316");
-            let mut segmenter = Command::new(&config.ffmpeg_path)
-                .args(segmenter_args(
-                    config,
-                    &output,
-                    loopback_port,
-                    &segment_input,
-                ))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(capture_log))
-                .spawn()?;
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            let video_log =
-                match fs::File::create(config.buffer_directory.join("video-capture.log")) {
-                    Ok(log) => log,
-                    Err(error) => {
-                        request_child_stop(&mut segmenter);
-                        finish_child(segmenter);
-                        return Err(error.into());
-                    }
-                };
-            let video = match Command::new(&config.ffmpeg_path)
-                .args(gpu_video_capture_args(config, &monitor, &video_output))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::from(video_log))
-                .spawn()
-            {
-                Ok(video) => video,
-                Err(error) => {
-                    request_child_stop(&mut segmenter);
-                    finish_child(segmenter);
-                    return Err(error.into());
-                }
-            };
-            (segmenter, Some(video))
-        } else {
-            (
-                Command::new(&config.ffmpeg_path)
-                    .args(capture_args_with_loopback(
-                        config,
-                        &monitor,
-                        &output,
-                        loopback_port,
-                    ))
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::from(capture_log))
-                    .spawn()?,
-                None,
-            )
-        };
+        // Capture, encode, mix audio, and segment in one process. The previous
+        // NVIDIA path used a second FFmpeg instance and a UDP bridge, which could
+        // overrun under GPU contention and was the main source of skipped frames.
+        let mut child = hidden_command(&capture_config.ffmpeg_path)
+            .args(capture_args_with_loopback(
+                &capture_config,
+                &monitor,
+                &output,
+                loopback_port,
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(capture_log))
+            .spawn()?;
         if let (Some(endpoint), Some(listener)) = (loopback_endpoint, listener) {
             match LoopbackCapture::start(endpoint, listener) {
                 Ok(loopback) => self.loopback = Some(loopback),
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    if let Some(video) = video_child.as_mut() {
-                        let _ = video.kill();
-                        let _ = video.wait();
-                    }
                     return Err(CaptureError::ProcessFailed(error));
                 }
             }
         }
         self.child = Some(child);
-        self.video_child = video_child;
+        self.active_encoder = Some(capture_config.encoder);
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), CaptureError> {
+        if let Some(mut obs) = self.obs.take() {
+            obs.stop()
+                .map_err(|error| CaptureError::Obs(error.to_string()))?;
+            self.active_encoder = None;
+            return Ok(());
+        }
         let mut child = self.child.take().ok_or(CaptureError::NotRunning)?;
         request_child_stop(&mut child);
-        if let Some(video) = self.video_child.as_mut() {
-            request_child_stop(video);
-        }
         if let Some(mut loopback) = self.loopback.take() {
             loopback.stop();
         }
         finish_child(child);
-        if let Some(video) = self.video_child.take() {
-            finish_child(video);
-        }
+        self.active_encoder = None;
         Ok(())
+    }
+
+    pub fn active_encoder(&self) -> Option<EncoderBackend> {
+        self.active_encoder
+    }
+
+    pub fn active_engine(&self) -> Option<CaptureEngine> {
+        if self.obs.is_some() {
+            Some(CaptureEngine::Obs)
+        } else if self.child.is_some() {
+            Some(CaptureEngine::Ffmpeg)
+        } else {
+            None
+        }
+    }
+
+    pub fn request_replay_save(
+        &self,
+        config: &AppConfig,
+        clip_seconds: u32,
+    ) -> Result<ReplaySaveRequest, CaptureError> {
+        if let Some(obs) = self.obs.as_ref() {
+            return obs
+                .request_replay(config, clip_seconds)
+                .map(ReplaySaveRequest::Obs)
+                .map_err(|error| CaptureError::Obs(error.to_string()));
+        }
+        Ok(ReplaySaveRequest::Ffmpeg {
+            config: config.clone(),
+            clip_seconds,
+            capture_running: self.child.is_some(),
+        })
+    }
+
+    pub fn detect_encoder(ffmpeg: &Path) -> EncoderBackend {
+        [
+            EncoderBackend::Nvidia,
+            EncoderBackend::Amd,
+            EncoderBackend::Intel,
+        ]
+        .into_iter()
+        .find(|backend| encoder_available(ffmpeg, *backend))
+        .unwrap_or(EncoderBackend::Software)
     }
 
     pub fn save_replay(&self, config: &AppConfig) -> Result<Clip, CaptureError> {
@@ -213,9 +266,20 @@ impl CaptureManager {
         config: &AppConfig,
         clip_seconds: u32,
     ) -> Result<Clip, CaptureError> {
+        Self::save_replay_snapshot(config, clip_seconds, self.child.is_some())
+    }
+
+    /// Materializes a replay from complete buffer segments. This function owns
+    /// no recorder state, so callers can run it on a worker thread without
+    /// blocking the application's event loop.
+    pub fn save_replay_snapshot(
+        config: &AppConfig,
+        clip_seconds: u32,
+        capture_running: bool,
+    ) -> Result<Clip, CaptureError> {
         let mut segments = list_segments(&config.buffer_directory)?;
         // FFmpeg may still be writing the newest segment. Only concatenate complete files.
-        if self.child.is_some() && !segments.is_empty() {
+        if capture_running && !segments.is_empty() {
             segments.pop();
         }
         let wanted = clip_seconds.max(1).div_ceil(config.segment_seconds) as usize;
@@ -248,7 +312,7 @@ impl CaptureManager {
         start: f32,
         end: f32,
     ) -> Result<(), CaptureError> {
-        let result = Command::new(&config.ffmpeg_path)
+        let result = hidden_command(&config.ffmpeg_path)
             .args([
                 "-y",
                 "-ss",
@@ -287,10 +351,7 @@ impl Drop for CaptureManager {
             request_child_stop(&mut child);
             finish_child(child);
         }
-        if let Some(mut child) = self.video_child.take() {
-            request_child_stop(&mut child);
-            finish_child(child);
-        }
+        self.active_encoder = None;
     }
 }
 
@@ -312,6 +373,41 @@ fn finish_child(mut child: Child) {
     let _ = child.wait();
 }
 
+fn encoder_available(ffmpeg: &Path, backend: EncoderBackend) -> bool {
+    let encoder = match backend {
+        EncoderBackend::Auto => return true,
+        EncoderBackend::Software => "libx264",
+        EncoderBackend::Nvidia => "h264_nvenc",
+        EncoderBackend::Amd => "h264_amf",
+        EncoderBackend::Intel => "h264_qsv",
+    };
+    hidden_command(ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            // Current NVIDIA drivers reject dimensions below the encoder's
+            // hardware minimum even for a capability probe.
+            "color=size=256x256:rate=1",
+            "-frames:v",
+            "1",
+            "-an",
+            "-c:v",
+            encoder,
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[cfg(test)]
 fn capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &Path) -> Vec<String> {
     capture_args_with_loopback(config, monitor, output, None)
@@ -327,6 +423,8 @@ fn capture_args_with_loopback(
     let output_height = config.output_height.max(360) / 2 * 2;
     let use_ddagrab = uses_ddagrab(config, monitor);
     let codec = match (config.encoder, config.video_codec) {
+        (EncoderBackend::Auto, VideoCodec::H264) => "libx264",
+        (EncoderBackend::Auto, VideoCodec::H265) => "libx265",
         (EncoderBackend::Software, VideoCodec::H264) => "libx264",
         (EncoderBackend::Software, VideoCodec::H265) => "libx265",
         (EncoderBackend::Nvidia, VideoCodec::H264) => "h264_nvenc",
@@ -351,8 +449,10 @@ fn capture_args_with_loopback(
             "lavfi".into(),
             "-i".into(),
             format!(
-                "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1",
-                monitor.output_index, config.frame_rate
+                "ddagrab=output_idx={}:framerate={}:draw_mouse={}:dup_frames=1",
+                monitor.output_index,
+                config.frame_rate,
+                u8::from(config.capture_cursor)
             ),
         ]);
     } else {
@@ -363,6 +463,8 @@ fn capture_args_with_loopback(
             "gdigrab".into(),
             "-framerate".into(),
             config.frame_rate.to_string(),
+            "-draw_mouse".into(),
+            u8::from(config.capture_cursor).to_string(),
             "-offset_x".into(),
             monitor.x.to_string(),
             "-offset_y".into(),
@@ -377,7 +479,27 @@ fn capture_args_with_loopback(
     for source in &audio_sources {
         append_audio_input_args(&mut args, source, loopback_port);
     }
-    if !use_ddagrab {
+    if use_ddagrab {
+        let direct_size = matches!(
+            config.video_aspect_ratio,
+            VideoAspectRatio::Stretch16By9 | VideoAspectRatio::Game
+        ) && output_width == monitor.width
+            && output_height == monitor.height;
+        if !direct_size {
+            // Desktop Duplication is still dramatically faster than GDI on
+            // high-resolution monitors. Download only when a transform is
+            // required; same-size capture remains zero-copy into NVENC.
+            args.extend([
+                "-vf".into(),
+                dda_software_filter(
+                    config.video_aspect_ratio,
+                    monitor,
+                    output_width,
+                    output_height,
+                ),
+            ]);
+        }
+    } else {
         args.extend([
             "-vf".into(),
             video_filter(
@@ -393,20 +515,30 @@ fn capture_args_with_loopback(
         args.extend(["-pix_fmt".into(), "yuv420p".into()]);
     }
     match config.encoder {
-        EncoderBackend::Software => args.extend(["-preset".into(), "veryfast".into()]),
+        EncoderBackend::Auto | EncoderBackend::Software => {
+            args.extend(["-preset".into(), "veryfast".into()])
+        }
         EncoderBackend::Nvidia => args.extend([
             "-preset".into(),
-            "p4".into(),
+            "p2".into(),
             "-tune".into(),
             "ll".into(),
             "-rc".into(),
             "cbr".into(),
+            "-multipass".into(),
+            "disabled".into(),
+            "-rc-lookahead".into(),
+            "0".into(),
             "-bf".into(),
+            "0".into(),
+            "-spatial-aq".into(),
+            "0".into(),
+            "-temporal-aq".into(),
             "0".into(),
             "-forced-idr".into(),
             "1".into(),
         ]),
-        EncoderBackend::Amd => args.extend(["-quality".into(), "balanced".into()]),
+        EncoderBackend::Amd => args.extend(["-quality".into(), "speed".into()]),
         EncoderBackend::Intel => args.extend(["-preset".into(), "veryfast".into()]),
     }
     append_audio_output_args(&mut args, config, &audio_sources);
@@ -439,129 +571,35 @@ fn capture_args_with_loopback(
     args
 }
 
-fn uses_ddagrab(config: &AppConfig, monitor: &MonitorInfo) -> bool {
-    let output_width = config.output_width.max(640) / 2 * 2;
-    let output_height = config.output_height.max(360) / 2 * 2;
+fn uses_ddagrab(config: &AppConfig, _monitor: &MonitorInfo) -> bool {
     cfg!(windows)
         && config.encoder == EncoderBackend::Nvidia
-        && output_width == monitor.width
-        && output_height == monitor.height
-        && matches!(
-            config.video_aspect_ratio,
-            VideoAspectRatio::Stretch16By9 | VideoAspectRatio::Game
-        )
+        && !(config.capture_cursor && config.animated_cursor_compatibility)
 }
 
-fn gpu_video_capture_args(config: &AppConfig, monitor: &MonitorInfo, output: &str) -> Vec<String> {
-    let codec = match config.video_codec {
-        VideoCodec::H264 => "h264_nvenc",
-        VideoCodec::H265 => "hevc_nvenc",
-    };
-    vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "warning".into(),
-        "-stats_period".into(),
-        "30".into(),
-        "-stats".into(),
-        "-y".into(),
-        "-f".into(),
-        "lavfi".into(),
-        "-i".into(),
-        format!(
-            "ddagrab=output_idx={}:framerate={}:draw_mouse=1:dup_frames=1",
-            monitor.output_index, config.frame_rate
+fn dda_software_filter(
+    mode: VideoAspectRatio,
+    monitor: &MonitorInfo,
+    output_width: u32,
+    output_height: u32,
+) -> String {
+    let transform = match mode {
+        VideoAspectRatio::Stretch16By9 => {
+            format!("scale={output_width}:{output_height}:flags=fast_bilinear,setsar=1")
+        }
+        VideoAspectRatio::Fit16By9 => format!(
+            "scale={output_width}:{output_height}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         ),
-        "-c:v".into(),
-        codec.into(),
-        "-preset".into(),
-        "p1".into(),
-        "-tune".into(),
-        "ull".into(),
-        "-rc".into(),
-        "cbr".into(),
-        "-multipass".into(),
-        "disabled".into(),
-        "-rc-lookahead".into(),
-        "0".into(),
-        "-bf".into(),
-        "0".into(),
-        "-zerolatency".into(),
-        "1".into(),
-        "-delay".into(),
-        "0".into(),
-        "-forced-idr".into(),
-        "1".into(),
-        "-b:v".into(),
-        format!("{}M", config.video_bitrate_mbps),
-        "-maxrate".into(),
-        format!("{}M", config.video_bitrate_mbps),
-        "-bufsize".into(),
-        format!("{}M", config.video_bitrate_mbps.saturating_mul(2)),
-        "-g".into(),
-        config
-            .frame_rate
-            .saturating_mul(config.segment_seconds)
-            .to_string(),
-        "-fps_mode".into(),
-        "cfr".into(),
-        "-force_key_frames".into(),
-        format!("expr:gte(t,n_forced*{})", config.segment_seconds),
-        "-an".into(),
-        "-f".into(),
-        "mpegts".into(),
-        "-mpegts_copyts".into(),
-        "1".into(),
-        "-muxdelay".into(),
-        "0".into(),
-        "-muxpreload".into(),
-        "0".into(),
-        "-flush_packets".into(),
-        "1".into(),
-        output.into(),
-    ]
-}
-
-fn segmenter_args(
-    config: &AppConfig,
-    output: &Path,
-    loopback_port: Option<u16>,
-    video_input: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "-hide_banner".into(),
-        "-loglevel".into(),
-        "warning".into(),
-        "-stats_period".into(),
-        "30".into(),
-        "-stats".into(),
-        "-y".into(),
-        "-thread_queue_size".into(),
-        "4096".into(),
-        "-fflags".into(),
-        "+genpts".into(),
-        "-i".into(),
-        video_input.into(),
-    ];
-    let audio_sources = audio_sources(config);
-    for source in &audio_sources {
-        append_audio_input_args(&mut args, source, loopback_port);
-    }
-    append_audio_output_args(&mut args, config, &audio_sources);
-    args.extend([
-        "-c:v".into(),
-        "copy".into(),
-        "-f".into(),
-        "segment".into(),
-        "-segment_time".into(),
-        config.segment_seconds.to_string(),
-        "-segment_wrap".into(),
-        (config.max_buffer_seconds().div_ceil(config.segment_seconds) + 3).to_string(),
-        "-reset_timestamps".into(),
-        "1".into(),
-        output.display().to_string(),
-    ]);
-    args
+        VideoAspectRatio::Game => {
+            let (width, height) =
+                fit_inside(monitor.width, monitor.height, output_width, output_height);
+            format!("scale={width}:{height}:flags=fast_bilinear,setsar=1")
+        }
+        VideoAspectRatio::Crop16By9 => format!(
+            "scale={output_width}:{output_height}:force_original_aspect_ratio=increase:flags=fast_bilinear,crop={output_width}:{output_height},setsar=1"
+        ),
+    };
+    format!("hwdownload,format=bgra,{transform},format=nv12")
 }
 
 fn append_audio_input_args(
@@ -811,7 +849,7 @@ fn concatenate(
     let list_path = output.with_extension("concat.txt");
     let list = concat_list(segments, segment_seconds);
     fs::write(&list_path, list)?;
-    let result = Command::new(ffmpeg)
+    let result = hidden_command(ffmpeg)
         .args(["-y", "-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
         .args(["-map", "0", "-c", "copy"])
@@ -902,6 +940,8 @@ mod tests {
             video_codec: VideoCodec::H265,
             output_width: 2560,
             output_height: 1440,
+            video_bitrate_mbps: 24,
+            animated_cursor_compatibility: false,
             ..AppConfig::default()
         };
         let monitor = MonitorInfo {
@@ -916,7 +956,8 @@ mod tests {
         };
         let joined = capture_args(&config, &monitor, Path::new("buffer.mp4")).join(" ");
         assert!(joined.contains("-c:v hevc_nvenc"));
-        assert!(joined.contains("-preset p4 -tune ll -rc cbr -bf 0"));
+        assert!(joined.contains("-preset p2 -tune ll -rc cbr -multipass disabled"));
+        assert!(joined.contains("-rc-lookahead 0 -bf 0 -spatial-aq 0 -temporal-aq 0"));
         assert!(joined.contains("-b:v 24M"));
         if cfg!(windows) {
             assert!(joined.contains("-f lavfi -i ddagrab=output_idx=0:framerate=60"));
@@ -925,6 +966,41 @@ mod tests {
         } else {
             assert!(joined.contains("gdigrab"));
         }
+    }
+
+    #[test]
+    fn nvidia_downscale_uses_desktop_duplication_instead_of_gdi() {
+        let monitor = MonitorInfo {
+            output_index: 0,
+            id: "display1".into(),
+            label: "Display 1".into(),
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440,
+            primary: true,
+        };
+        let fast = AppConfig {
+            encoder: EncoderBackend::Nvidia,
+            output_width: 1920,
+            output_height: 1080,
+            animated_cursor_compatibility: false,
+            ..AppConfig::default()
+        };
+        let joined = capture_args(&fast, &monitor, Path::new("buffer.mp4")).join(" ");
+        if cfg!(windows) {
+            assert!(joined.contains("ddagrab=output_idx=0"));
+            assert!(joined.contains("hwdownload,format=bgra,scale=1920:1080:flags=fast_bilinear"));
+            assert!(!joined.contains("gdigrab"));
+        }
+
+        let compatible = AppConfig {
+            animated_cursor_compatibility: true,
+            ..fast
+        };
+        let joined = capture_args(&compatible, &monitor, Path::new("buffer.mp4")).join(" ");
+        assert!(joined.contains("gdigrab"));
+        assert!(joined.contains("-draw_mouse 1"));
     }
 
     #[test]
@@ -1013,48 +1089,6 @@ mod tests {
         assert!(joined.contains("-f f32le -ar 48000 -ac 2"));
         assert!(joined.contains("tcp://127.0.0.1:43123"));
         assert!(!joined.contains("audio=wasapi-render"));
-    }
-
-    #[test]
-    fn split_gpu_capture_keeps_desktop_grab_separate_from_audio_and_segments() {
-        let config = AppConfig {
-            encoder: EncoderBackend::Nvidia,
-            video_codec: VideoCodec::H264,
-            output_width: 1920,
-            output_height: 1080,
-            frame_rate: 60,
-            desktop_audio_enabled: true,
-            desktop_audio_device: Some("wasapi-render:windows-endpoint".into()),
-            ..AppConfig::default()
-        };
-        let monitor = MonitorInfo {
-            output_index: 0,
-            id: "display1".into(),
-            label: "Display 1".into(),
-            x: 0,
-            y: 0,
-            width: 1920,
-            height: 1080,
-            primary: true,
-        };
-
-        let video = gpu_video_capture_args(&config, &monitor, "udp://127.0.0.1:43123").join(" ");
-        assert!(video.contains("ddagrab=output_idx=0:framerate=60"));
-        assert!(video.contains("-c:v h264_nvenc -preset p1 -tune ull"));
-        assert!(video.contains("-rc-lookahead 0 -bf 0 -zerolatency 1"));
-        assert!(!video.contains("dshow"));
-
-        let segmenter = segmenter_args(
-            &config,
-            Path::new("buffer-%03d.mp4"),
-            Some(43124),
-            "udp://127.0.0.1:43123",
-        )
-        .join(" ");
-        assert!(segmenter.contains("-c:v copy"));
-        assert!(segmenter.contains("-f segment -segment_time"));
-        assert!(segmenter.contains("tcp://127.0.0.1:43124"));
-        assert!(!segmenter.contains("h264_nvenc"));
     }
 
     #[test]

@@ -56,6 +56,20 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "numeric-version=$numericVersion" >> $env:GITHUB_OUTPUT
 
+      - name: Cache official OBS runtime archive
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/xyra-obs-32.2.1
+          key: obs-studio-windows-x64-32.2.1
+
+      - name: Stage OBS capture runtime
+        shell: pwsh
+        run: |
+          & scripts/stage-obs-runtime.ps1 -Destination obs-runtime
+          $runtime = (Resolve-Path -LiteralPath obs-runtime).Path
+          $runtime | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "XYRA_OBS_RUNTIME=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Test and lint
         shell: pwsh
         run: |
@@ -110,6 +124,18 @@ jobs:
           $installedApplication = Join-Path $installDirectory 'xyra.exe'
           if (-not (Test-Path -LiteralPath $installedApplication -PathType Leaf)) {
             throw 'The installer completed without installing xyra.exe.'
+          }
+          foreach ($runtimeFile in @(
+            'obs.dll',
+            'libobs-d3d11.dll',
+            'obs-ffmpeg-mux.exe',
+            'xyra-plugins\64bit\win-capture.dll',
+            'xyra-plugins\64bit\win-wasapi.dll',
+            'data\libobs'
+          )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $installDirectory $runtimeFile))) {
+              throw "The installer is missing required OBS runtime component: $runtimeFile"
+            }
           }
           $uninstaller = Join-Path $installDirectory 'unins000.exe'
           $uninstall = Start-Process -FilePath $uninstaller -WindowStyle Hidden -Wait -PassThru -ArgumentList @(

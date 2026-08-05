@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    collections::HashMap,
     path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
 
@@ -16,15 +18,20 @@ use xyra::{
     },
     capture::CaptureManager,
     config::{
-        AppConfig, CaptureQuality, ClipHotkey, EncoderBackend, HotkeyModifier, VideoAspectRatio,
-        VideoCodec, managed_ffmpeg_path,
+        AppConfig, CaptureEngine, CaptureQuality, ClipHotkey, EncoderBackend, HotkeyModifier,
+        VideoAspectRatio, VideoCodec, managed_ffmpeg_path,
     },
     display::{MonitorInfo, enumerate_monitors, selected_monitor},
     ffmpeg::{FfmpegInstaller, InstallState},
     library::scan_clips,
     model::{Clip, EditProject, Platform, PublishJob, PublishStatus, PublishTarget},
+    obs_capture::{OBS_RUNTIME_VERSION, runtime_available as obs_runtime_available},
     player::{PREVIEW_HEIGHT, PREVIEW_WIDTH, VideoPlayer},
-    publish::{PublishQueue, connection_help},
+    process::hidden_command,
+    publish::{
+        PublishEvent, PublishQueue, PublishTask, PublishWorker, YouTubeAuthEvent, connection_help,
+        disconnect_youtube, start_youtube_oauth, youtube_connected,
+    },
     startup::sync_startup_registration,
     system_tray::{SystemTray, TrayAction},
 };
@@ -91,6 +98,7 @@ struct XyraApp {
     player_texture: Option<egui::TextureHandle>,
     search: String,
     monitors: Vec<MonitorInfo>,
+    detected_encoder: EncoderBackend,
     audio_devices: Vec<AudioDevice>,
     saved_config_state: String,
     config_save_due: Option<Instant>,
@@ -100,6 +108,22 @@ struct XyraApp {
     hotkey_status: String,
     tray: Option<SystemTray>,
     quit_requested: bool,
+    clip_save_sender: Sender<(Result<Clip, String>, bool)>,
+    clip_save_receiver: Receiver<(Result<Clip, String>, bool)>,
+    clip_save_in_progress: bool,
+    publish_worker: PublishWorker,
+    publish_links: HashMap<Uuid, Vec<String>>,
+    youtube_auth_sender: Sender<YouTubeAuthEvent>,
+    youtube_auth_receiver: Receiver<YouTubeAuthEvent>,
+    youtube_auth_in_progress: bool,
+    youtube_client_secret_input: String,
+    youtube_connected: bool,
+    library_scan_sender: Sender<Result<Vec<Clip>, String>>,
+    library_scan_receiver: Receiver<Result<Vec<Clip>, String>>,
+    library_scan_in_progress: bool,
+    export_sender: Sender<Result<PathBuf, String>>,
+    export_receiver: Receiver<Result<PathBuf, String>>,
+    export_in_progress: bool,
 }
 
 impl XyraApp {
@@ -107,6 +131,11 @@ impl XyraApp {
         configure_style(&cc.egui_ctx);
         let mut config = AppConfig::load().unwrap_or_default();
         let ffmpeg_ready = CaptureManager::ffmpeg_available(&config);
+        let detected_encoder = if ffmpeg_ready {
+            CaptureManager::detect_encoder(&config.ffmpeg_path)
+        } else {
+            EncoderBackend::Software
+        };
         let audio_devices = if ffmpeg_ready {
             enumerate_audio_devices(&config.ffmpeg_path).unwrap_or_default()
         } else {
@@ -143,11 +172,12 @@ impl XyraApp {
         if started_hidden && tray.is_some() {
             status = "Xyra started in the system tray".into();
         }
-        let clips = scan_clips(
-            &config.clips_directory,
-            ffmpeg_ready.then_some(config.ffmpeg_path.as_path()),
-        )
-        .unwrap_or_default();
+        let clips = Vec::new();
+        let targets = config.publish_targets.clone();
+        let (clip_save_sender, clip_save_receiver) = mpsc::channel();
+        let (youtube_auth_sender, youtube_auth_receiver) = mpsc::channel();
+        let (library_scan_sender, library_scan_receiver) = mpsc::channel();
+        let (export_sender, export_receiver) = mpsc::channel();
         let mut app = Self {
             config,
             capture: CaptureManager::default(),
@@ -155,7 +185,7 @@ impl XyraApp {
             selected: None,
             project: None,
             page: Page::Library,
-            targets: Platform::ALL.into_iter().map(PublishTarget::new).collect(),
+            targets,
             queue: PublishQueue::default(),
             status,
             ffmpeg_ready,
@@ -165,6 +195,7 @@ impl XyraApp {
             player_texture: None,
             search: String::new(),
             monitors: enumerate_monitors(),
+            detected_encoder,
             audio_devices,
             saved_config_state,
             config_save_due: None,
@@ -174,8 +205,25 @@ impl XyraApp {
             hotkey_status: String::new(),
             tray,
             quit_requested: false,
+            clip_save_sender,
+            clip_save_receiver,
+            clip_save_in_progress: false,
+            publish_worker: PublishWorker::default(),
+            publish_links: HashMap::new(),
+            youtube_auth_sender,
+            youtube_auth_receiver,
+            youtube_auth_in_progress: false,
+            youtube_client_secret_input: String::new(),
+            youtube_connected: youtube_connected(),
+            library_scan_sender,
+            library_scan_receiver,
+            library_scan_in_progress: false,
+            export_sender,
+            export_receiver,
+            export_in_progress: false,
         };
         app.refresh_hotkeys();
+        app.begin_library_scan();
         app
     }
 
@@ -267,6 +315,7 @@ impl XyraApp {
     }
 
     fn poll_config_auto_save(&mut self, ctx: &egui::Context) {
+        self.config.publish_targets.clone_from(&self.targets);
         let Ok(current_state) = serde_json::to_string(&self.config) else {
             return;
         };
@@ -322,6 +371,31 @@ impl XyraApp {
         self.selected.and_then(|index| self.clips.get(index))
     }
 
+    fn begin_library_scan(&mut self) {
+        if self.library_scan_in_progress {
+            return;
+        }
+        let directory = self.config.clips_directory.clone();
+        let ffmpeg = self.ffmpeg_ready.then_some(self.config.ffmpeg_path.clone());
+        let sender = self.library_scan_sender.clone();
+        self.library_scan_in_progress = true;
+        std::thread::spawn(move || {
+            let result =
+                scan_clips(&directory, ffmpeg.as_deref()).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+    }
+
+    fn poll_library_scan(&mut self) {
+        while let Ok(result) = self.library_scan_receiver.try_recv() {
+            self.library_scan_in_progress = false;
+            match result {
+                Ok(clips) => self.clips = clips,
+                Err(error) => self.status = format!("Could not refresh clips: {error}"),
+            }
+        }
+    }
+
     fn start_or_stop(&mut self) {
         if self.capture.is_running() {
             match self.capture.stop() {
@@ -330,7 +404,21 @@ impl XyraApp {
             }
         } else {
             match self.capture.start(&self.config) {
-                Ok(()) => self.status = "Replay buffer is recording".into(),
+                Ok(()) => {
+                    let encoder = self
+                        .capture
+                        .active_encoder()
+                        .unwrap_or(EncoderBackend::Software);
+                    let engine = self
+                        .capture
+                        .active_engine()
+                        .map(CaptureEngine::label)
+                        .unwrap_or("capture engine");
+                    self.status = format!(
+                        "Replay buffer is recording with {engine} / {}",
+                        encoder.label()
+                    );
+                }
                 Err(error) => self.status = error.to_string(),
             }
         }
@@ -383,19 +471,63 @@ impl XyraApp {
     }
 
     fn save_clip_duration(&mut self, seconds: u32, open_after_save: bool) {
-        match self.capture.save_replay_duration(&self.config, seconds) {
-            Ok(clip) => {
-                self.status = format!(
-                    "Saved the previous {} sec to {}",
-                    clip.duration_secs.round() as u32,
-                    clip.path.display()
-                );
-                self.clips.insert(0, clip);
-                if open_after_save {
-                    self.select_clip(0);
-                }
+        if self.clip_save_in_progress {
+            self.status = "A clip is already being saved in the background".into();
+            return;
+        }
+        if !self.capture.is_running() {
+            self.status = "Start the replay buffer before saving a clip".into();
+            return;
+        }
+        let request = match self.capture.request_replay_save(&self.config, seconds) {
+            Ok(request) => request,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
             }
-            Err(error) => self.status = error.to_string(),
+        };
+        let sender = self.clip_save_sender.clone();
+        self.clip_save_in_progress = true;
+        self.status = format!("Saving the previous {seconds} seconds...");
+        std::thread::spawn(move || {
+            let result = request.complete().map_err(|error| error.to_string());
+            let _ = sender.send((result, open_after_save));
+        });
+    }
+
+    fn poll_clip_save(&mut self) {
+        while let Ok((result, open_after_save)) = self.clip_save_receiver.try_recv() {
+            self.clip_save_in_progress = false;
+            match result {
+                Ok(clip) => {
+                    self.status = format!(
+                        "Saved the previous {} sec to {}",
+                        clip.duration_secs.round() as u32,
+                        clip.path.display()
+                    );
+                    self.clips.insert(0, clip);
+                    if self.config.auto_queue_after_clip {
+                        self.select_clip(0);
+                        self.queue_publish();
+                    } else if open_after_save {
+                        self.select_clip(0);
+                    }
+                }
+                Err(error) => self.status = error,
+            }
+        }
+    }
+
+    fn poll_export(&mut self) {
+        while let Ok(result) = self.export_receiver.try_recv() {
+            self.export_in_progress = false;
+            match result {
+                Ok(path) => {
+                    self.status = format!("Exported {}", path.display());
+                    self.begin_library_scan();
+                }
+                Err(error) => self.status = error,
+            }
         }
     }
 
@@ -419,17 +551,78 @@ impl XyraApp {
         let job = PublishJob {
             id: Uuid::new_v4(),
             clip_id: clip.id,
+            clip_path: clip.path,
             title: clip.title,
             description: clip.description,
             targets: self.targets.clone(),
             created_at: Utc::now(),
             status: PublishStatus::Queued,
         };
-        match self.queue.enqueue(job) {
-            Ok(()) => {
-                self.status = "Upload queued (account connection is the next milestone)".into()
-            }
+        if job
+            .targets
+            .iter()
+            .any(|target| target.enabled && target.platform == Platform::YouTube)
+            && !self.youtube_connected
+        {
+            self.status = "Connect YouTube before adding this upload".into();
+            return;
+        }
+        match self.queue.enqueue(job.clone()) {
+            Ok(()) => match self.publish_worker.enqueue(PublishTask {
+                job,
+                config: self.config.clone(),
+            }) {
+                Ok(()) => self.status = "Upload started in the background".into(),
+                Err(error) => self.status = error,
+            },
             Err(error) => self.status = error.to_string(),
+        }
+    }
+
+    fn poll_publish(&mut self) {
+        while let Ok(event) = self.youtube_auth_receiver.try_recv() {
+            self.youtube_auth_in_progress = false;
+            match event {
+                YouTubeAuthEvent::Connected => {
+                    self.youtube_connected = true;
+                    self.youtube_client_secret_input.clear();
+                    self.status = "YouTube connected securely".into();
+                }
+                YouTubeAuthEvent::Failed(error) => {
+                    self.status = format!("YouTube connection failed: {error}")
+                }
+            }
+        }
+        for event in self.publish_worker.try_iter().collect::<Vec<_>>() {
+            match event {
+                PublishEvent::Progress {
+                    job_id,
+                    platform,
+                    progress,
+                } => {
+                    if let Some(job) = self.queue.job_mut(job_id) {
+                        job.status = PublishStatus::Uploading { platform, progress };
+                    }
+                    self.status = format!(
+                        "Uploading to {} - {}%",
+                        platform.label(),
+                        (progress * 100.0).round() as u32
+                    );
+                }
+                PublishEvent::Complete { job_id, links } => {
+                    if let Some(job) = self.queue.job_mut(job_id) {
+                        job.status = PublishStatus::Complete;
+                    }
+                    self.publish_links.insert(job_id, links);
+                    self.status = "Upload completed".into();
+                }
+                PublishEvent::Failed { job_id, error } => {
+                    if let Some(job) = self.queue.job_mut(job_id) {
+                        job.status = PublishStatus::Failed(error.clone());
+                    }
+                    self.status = format!("Upload failed: {error}");
+                }
+            }
         }
     }
 
@@ -442,12 +635,9 @@ impl XyraApp {
                 self.config.ffmpeg_path = self.ffmpeg_installer.destination().to_path_buf();
                 self.ffmpeg_input = self.config.ffmpeg_path.display().to_string();
                 self.ffmpeg_ready = CaptureManager::ffmpeg_available(&self.config);
+                self.detected_encoder = CaptureManager::detect_encoder(&self.config.ffmpeg_path);
                 self.refresh_audio_devices();
-                if let Ok(clips) =
-                    scan_clips(&self.config.clips_directory, Some(&self.config.ffmpeg_path))
-                {
-                    self.clips = clips;
-                }
+                self.begin_library_scan();
                 self.status = "FFmpeg installed automatically. Capture is ready.".into();
                 let _ = self.config.save();
             }
@@ -555,6 +745,46 @@ impl XyraApp {
                         .color(MUTED),
                     );
                 });
+                ui.horizontal(|ui| {
+                    if ui.small_button("<- 5s").clicked() {
+                        self.player.seek(
+                            &self.config.ffmpeg_path,
+                            (self.player.position_secs() - 5.0).max(0.0),
+                        );
+                    }
+                    if ui.small_button("5s ->").clicked() {
+                        self.player.seek(
+                            &self.config.ffmpeg_path,
+                            (self.player.position_secs() + 5.0).min(self.player.duration_secs()),
+                        );
+                    }
+                    if ui.small_button("Restart").clicked() {
+                        self.player.seek(&self.config.ffmpeg_path, 0.0);
+                    }
+                    let muted = self.player.is_muted();
+                    if ui
+                        .small_button(if muted { "Unmute" } else { "Mute" })
+                        .clicked()
+                    {
+                        self.player.toggle_mute();
+                    }
+                    let mut volume = self.player.volume();
+                    ui.label(RichText::new("Volume").size(10.0).color(MUTED));
+                    if ui
+                        .add_sized(
+                            [110.0, 20.0],
+                            egui::Slider::new(&mut volume, 0.0..=1.5).show_value(false),
+                        )
+                        .changed()
+                    {
+                        self.player.set_volume(volume);
+                    }
+                    ui.label(
+                        RichText::new(format!("{}%", (volume * 100.0).round() as u32))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
                 if let Some(error) = self.player.error() {
                     ui.label(RichText::new(error).size(10.0).color(DANGER));
                 }
@@ -642,8 +872,12 @@ impl XyraApp {
                 );
                 ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    let (label, color) =
-                        ffmpeg_status(self.ffmpeg_installer.state(), self.ffmpeg_ready);
+                    let (label, color) = capture_status(
+                        self.config.capture_engine,
+                        obs_runtime_available(),
+                        self.ffmpeg_installer.state(),
+                        self.ffmpeg_ready,
+                    );
                     let (dot, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 4.0, color);
@@ -675,21 +909,24 @@ impl XyraApp {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled_ui(self.ffmpeg_ready || running, |ui| {
-                                ui.add_sized(
-                                    [144.0, 38.0],
-                                    egui::Button::new(
-                                        RichText::new(if running {
-                                            "Stop capture"
-                                        } else {
-                                            "Start capture"
-                                        })
-                                        .strong(),
+                            .add_enabled_ui(
+                                obs_runtime_available() || self.ffmpeg_ready || running,
+                                |ui| {
+                                    ui.add_sized(
+                                        [144.0, 38.0],
+                                        egui::Button::new(
+                                            RichText::new(if running {
+                                                "Stop capture"
+                                            } else {
+                                                "Start capture"
+                                            })
+                                            .strong(),
+                                        )
+                                        .fill(if running { DANGER } else { ACCENT })
+                                        .corner_radius(9),
                                     )
-                                    .fill(if running { DANGER } else { ACCENT })
-                                    .corner_radius(9),
-                                )
-                            })
+                                },
+                            )
                             .inner
                             .clicked()
                         {
@@ -718,6 +955,8 @@ impl XyraApp {
                         engine_badge(
                             ui,
                             running,
+                            self.config.capture_engine,
+                            obs_runtime_available(),
                             self.ffmpeg_installer.state(),
                             self.ffmpeg_ready,
                         );
@@ -936,25 +1175,38 @@ impl XyraApp {
                         );
                         ui.add_space(18.0);
                         if ui
-                            .add_sized(
-                                [ui.available_width(), 40.0],
-                                egui::Button::new(RichText::new("Export trimmed clip").strong())
-                                    .fill(ACCENT)
-                                    .corner_radius(9),
+                            .add_enabled(
+                                !self.export_in_progress,
+                                egui::Button::new(
+                                    RichText::new(if self.export_in_progress {
+                                        "Exporting..."
+                                    } else {
+                                        "Export trimmed clip"
+                                    })
+                                    .strong(),
+                                )
+                                .min_size(egui::vec2(ui.available_width(), 40.0))
+                                .fill(ACCENT)
+                                .corner_radius(9),
                             )
                             .clicked()
                         {
                             let output = export_path(&clip.path);
-                            match CaptureManager::export_trimmed(
-                                &self.config,
-                                &clip.path,
-                                &output,
-                                project.trim_start_secs,
-                                project.trim_end_secs,
-                            ) {
-                                Ok(()) => self.status = format!("Exported {}", output.display()),
-                                Err(error) => self.status = error.to_string(),
-                            }
+                            let input = clip.path.clone();
+                            let config = self.config.clone();
+                            let start = project.trim_start_secs;
+                            let end = project.trim_end_secs;
+                            let sender = self.export_sender.clone();
+                            self.export_in_progress = true;
+                            self.status = "Exporting the trimmed clip in the background...".into();
+                            std::thread::spawn(move || {
+                                let result = CaptureManager::export_trimmed(
+                                    &config, &input, &output, start, end,
+                                )
+                                .map(|()| output)
+                                .map_err(|error| error.to_string());
+                                let _ = sender.send(result);
+                            });
                         }
                     }
                 });
@@ -985,6 +1237,113 @@ impl XyraApp {
                         WARNING
                     },
                 ));
+            });
+        ui.add_space(16.0);
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(egui::Stroke::new(1.0, BORDER))
+            .corner_radius(14)
+            .inner_margin(20)
+            .show(ui, |ui| {
+                section_title(ui, "Platform connections");
+                ui.add_space(12.0);
+                ui.columns(2, |columns| {
+                    columns[0].label(
+                        RichText::new(if self.youtube_connected {
+                            "YouTube  /  Connected"
+                        } else {
+                            "YouTube  /  Not connected"
+                        })
+                        .strong()
+                        .color(if self.youtube_connected {
+                            SUCCESS
+                        } else {
+                            WARNING
+                        }),
+                    );
+                    columns[0].label(
+                        RichText::new(
+                            "Uses Google OAuth and the resumable YouTube upload API. Tokens are stored in Windows Credential Manager.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    columns[0].add_space(8.0);
+                    field_label(&mut columns[0], "GOOGLE OAUTH DESKTOP CLIENT ID");
+                    columns[0].text_edit_singleline(&mut self.config.youtube_client_id);
+                    columns[0].add_space(6.0);
+                    field_label(&mut columns[0], "CLIENT SECRET (IF PROVIDED BY GOOGLE)");
+                    columns[0].add(
+                        egui::TextEdit::singleline(&mut self.youtube_client_secret_input)
+                            .password(true)
+                            .hint_text("Stored securely; never written to config.json"),
+                    );
+                    columns[0].add_space(8.0);
+                    if self.youtube_connected {
+                        if columns[0].button("Disconnect YouTube").clicked() {
+                            match disconnect_youtube() {
+                                Ok(()) => {
+                                    self.youtube_connected = false;
+                                    self.status = "YouTube disconnected".into();
+                                }
+                                Err(error) => self.status = error,
+                            }
+                        }
+                    } else if columns[0]
+                        .add_enabled(
+                            !self.youtube_auth_in_progress,
+                            egui::Button::new(if self.youtube_auth_in_progress {
+                                "Waiting for Google..."
+                            } else {
+                                "Connect YouTube"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        match start_youtube_oauth(
+                            self.config.youtube_client_id.clone(),
+                            self.youtube_client_secret_input.clone(),
+                            self.youtube_auth_sender.clone(),
+                        ) {
+                            Ok(()) => {
+                                self.youtube_auth_in_progress = true;
+                                self.status =
+                                    "Finish signing in through the browser window".into();
+                            }
+                            Err(error) => self.status = error,
+                        }
+                    }
+
+                    columns[1].label(
+                        RichText::new("Odysee  /  Local LBRY SDK")
+                            .strong()
+                            .color(TEXT),
+                    );
+                    columns[1].label(
+                        RichText::new(
+                            "Uses the authenticated wallet in your local LBRY SDK. The SDK must be running before upload.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                    columns[1].add_space(8.0);
+                    field_label(&mut columns[1], "LBRY SDK API URL");
+                    columns[1].text_edit_singleline(&mut self.config.odysee_api_url);
+                    columns[1].add_space(6.0);
+                    field_label(&mut columns[1], "CLAIM BID (LBC)");
+                    columns[1].text_edit_singleline(&mut self.config.odysee_bid);
+                    columns[1].add_space(6.0);
+                    field_label(&mut columns[1], "CHANNEL CLAIM ID (OPTIONAL)");
+                    columns[1].text_edit_singleline(&mut self.config.odysee_channel_id);
+                    columns[1].add_space(8.0);
+                    columns[1].label(
+                        RichText::new(
+                            "Odysee/LBRY publications are public blockchain claims; Private and Unlisted are not offered as fake options.",
+                        )
+                        .size(11.0)
+                        .color(CYAN),
+                    );
+                });
             });
         ui.add_space(16.0);
         for target in &mut self.targets {
@@ -1045,7 +1404,34 @@ impl XyraApp {
             ui.label(RichText::new("Queued uploads will appear here.").color(MUTED));
         }
         for job in self.queue.jobs() {
-            ui.label(RichText::new(format!("{}  -  queued", job.title)).color(TEXT));
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(10)
+                .inner_margin(12)
+                .show(ui, |ui| {
+                    ui.label(RichText::new(&job.title).strong().color(TEXT));
+                    let (label, color) = match &job.status {
+                        PublishStatus::Queued => ("Queued".to_owned(), MUTED),
+                        PublishStatus::Uploading { platform, progress } => (
+                            format!(
+                                "Uploading to {} / {}%",
+                                platform.label(),
+                                (progress * 100.0).round() as u32
+                            ),
+                            CYAN,
+                        ),
+                        PublishStatus::Complete => ("Complete".to_owned(), SUCCESS),
+                        PublishStatus::Failed(error) => (format!("Failed / {error}"), DANGER),
+                    };
+                    ui.label(RichText::new(label).size(11.0).color(color));
+                    if let Some(links) = self.publish_links.get(&job.id) {
+                        for link in links {
+                            ui.hyperlink(link);
+                        }
+                    }
+                });
+            ui.add_space(8.0);
         }
     }
 
@@ -1116,6 +1502,47 @@ impl XyraApp {
                         .color(MUTED),
                 );
                 ui.add_space(14.0);
+                ui.columns(2, |columns| {
+                    field_label(&mut columns[0], "CAPTURE ENGINE");
+                    egui::ComboBox::from_id_salt("capture_engine")
+                        .selected_text(self.config.capture_engine.label())
+                        .width(columns[0].available_width())
+                        .show_ui(&mut columns[0], |ui| {
+                            for engine in CaptureEngine::ALL {
+                                ui.selectable_value(
+                                    &mut self.config.capture_engine,
+                                    engine,
+                                    engine.label(),
+                                );
+                            }
+                        });
+                    columns[0].label(
+                        RichText::new(self.config.capture_engine.description())
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+
+                    field_label(&mut columns[1], "OBS RUNTIME");
+                    let (runtime_text, runtime_color) = if obs_runtime_available() {
+                        (format!("OBS {OBS_RUNTIME_VERSION} ready"), SUCCESS)
+                    } else {
+                        ("OBS runtime missing; installer repair required".into(), WARNING)
+                    };
+                    columns[1].label(
+                        RichText::new(runtime_text)
+                            .size(12.0)
+                            .strong()
+                            .color(runtime_color),
+                    );
+                    columns[1].label(
+                        RichText::new("OBS is bundled with release installers. Legacy FFmpeg remains available for recovery.")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(16.0);
                 let mut chosen_quality = None;
                 ui.columns(4, |columns| {
                     for (column, quality) in columns.iter_mut().zip(CaptureQuality::ALL) {
@@ -1184,6 +1611,31 @@ impl XyraApp {
                         });
                 });
 
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let effective = if self.config.encoder == EncoderBackend::Auto {
+                        self.detected_encoder
+                    } else {
+                        self.config.encoder
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "Detected encoder: {} / Automatic mode re-checks the GPU and driver when capture starts",
+                            effective.label()
+                        ))
+                        .size(11.0)
+                        .color(CYAN),
+                    );
+                    if ui.small_button("Detect again").clicked() && self.ffmpeg_ready {
+                        self.detected_encoder =
+                            CaptureManager::detect_encoder(&self.config.ffmpeg_path);
+                        self.status = format!(
+                            "Automatic encoder detection selected {}",
+                            self.detected_encoder.label()
+                        );
+                    }
+                });
+
                 ui.add_space(16.0);
                 if self.config.quality == CaptureQuality::Custom {
                     egui::Grid::new("custom_quality_grid")
@@ -1207,7 +1659,7 @@ impl XyraApp {
                             ui.end_row();
                             field_label(ui, "FRAME RATE");
                             ui.add(
-                                egui::Slider::new(&mut self.config.frame_rate, 24..=240)
+                                egui::Slider::new(&mut self.config.frame_rate, 24..=120)
                                     .suffix(" fps"),
                             );
                             ui.end_row();
@@ -1220,6 +1672,7 @@ impl XyraApp {
                         });
                 } else {
                     let hardware_note = match self.config.encoder {
+                        EncoderBackend::Auto => "Xyra automatically selects the first working hardware encoder",
                         EncoderBackend::Software => "CPU encoding works on every PC",
                         _ => "Hardware encoding requires a compatible GPU and driver",
                     };
@@ -1250,6 +1703,28 @@ impl XyraApp {
                         self.monitors = enumerate_monitors();
                     }
                 });
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.config.capture_cursor, "Record mouse cursor");
+                    ui.add_enabled_ui(self.config.capture_cursor, |ui| {
+                        ui.checkbox(
+                            &mut self.config.animated_cursor_compatibility,
+                            "Accurate animated and inverted cursors",
+                        );
+                    });
+                });
+                ui.label(
+                    RichText::new(if self.config.animated_cursor_compatibility
+                        && self.config.capture_cursor
+                    {
+                        "Cursor compatibility uses Windows GDI capture so animated and inverted cursor frames are composited correctly. Disable it for the lowest GPU-copy overhead."
+                    } else {
+                        "Fast desktop duplication is enabled. Some animated or inverted cursor themes may not be composited correctly by the graphics driver."
+                    })
+                    .size(11.0)
+                    .color(MUTED),
+                );
 
                 ui.add_space(16.0);
                 ui.separator();
@@ -1782,6 +2257,10 @@ impl eframe::App for XyraApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_ffmpeg_install();
         self.poll_player(ui.ctx());
+        self.poll_clip_save();
+        self.poll_publish();
+        self.poll_library_scan();
+        self.poll_export();
         self.poll_hotkeys();
         self.poll_tray(ui.ctx());
         self.handle_window_close(ui.ctx());
@@ -1912,11 +2391,30 @@ fn ffmpeg_status(state: &InstallState, ready: bool) -> (String, Color32) {
     }
 }
 
-fn engine_badge(ui: &mut egui::Ui, running: bool, state: &InstallState, ready: bool) {
+fn capture_status(
+    engine: CaptureEngine,
+    obs_ready: bool,
+    state: &InstallState,
+    ffmpeg_ready: bool,
+) -> (String, Color32) {
+    if engine != CaptureEngine::Ffmpeg && obs_ready {
+        return ("OBS ready".into(), SUCCESS);
+    }
+    ffmpeg_status(state, ffmpeg_ready)
+}
+
+fn engine_badge(
+    ui: &mut egui::Ui,
+    running: bool,
+    engine: CaptureEngine,
+    obs_ready: bool,
+    state: &InstallState,
+    ready: bool,
+) {
     let (text, color) = if running {
         ("Recording".into(), DANGER)
     } else {
-        ffmpeg_status(state, ready)
+        capture_status(engine, obs_ready, state, ready)
     };
     egui::Frame::new()
         .fill(SURFACE)
@@ -2252,24 +2750,19 @@ fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     #[cfg(windows)]
     {
-        std::process::Command::new("explorer.exe")
+        hidden_command("explorer.exe")
             .arg("/select,")
             .arg(path)
             .spawn()?;
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(path)
-            .spawn()?;
+        hidden_command("open").arg("-R").arg(path).spawn()?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let directory = path.parent().unwrap_or(&path);
-        std::process::Command::new("xdg-open")
-            .arg(directory)
-            .spawn()?;
+        hidden_command("xdg-open").arg(directory).spawn()?;
     }
     Ok(())
 }

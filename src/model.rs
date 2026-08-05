@@ -27,9 +27,9 @@ impl Platform {
                 Visibility::Unlisted,
                 Visibility::Private,
             ],
-            // Odysee supports link-accessible unlisted publications, but does not
-            // expose a YouTube-equivalent private visibility for ordinary uploads.
-            Self::Odysee => &[Visibility::Public, Visibility::Unlisted],
+            // LBRY claims are public by design. The local SDK does not provide
+            // YouTube-equivalent private or unlisted visibility.
+            Self::Odysee => &[Visibility::Public],
         }
     }
 }
@@ -121,6 +121,7 @@ impl PublishTarget {
 pub struct PublishJob {
     pub id: Uuid,
     pub clip_id: Uuid,
+    pub clip_path: PathBuf,
     pub title: String,
     pub description: String,
     pub targets: Vec<PublishTarget>,

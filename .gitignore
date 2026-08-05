@@ -1,6 +1,7 @@
 /target/
 /target-updated/
 /dist/
+/obs-runtime/
 *.log
 .idea/
 .vscode/

@@ -1,11 +1,14 @@
 pub mod audio;
 pub mod capture;
 pub mod config;
+pub mod credentials;
 pub mod display;
 pub mod ffmpeg;
 pub mod library;
 pub mod model;
+pub mod obs_capture;
 pub mod player;
+pub mod process;
 pub mod publish;
 pub mod startup;
 pub mod system_tray;

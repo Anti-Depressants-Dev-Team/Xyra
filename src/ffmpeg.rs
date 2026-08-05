@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
 };
@@ -164,7 +164,7 @@ fn install(destination: &Path, progress: impl Fn(InstallState)) -> Result<(), St
 }
 
 fn executable_works(path: &Path) -> bool {
-    Command::new(path)
+    crate::process::hidden_command(path)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

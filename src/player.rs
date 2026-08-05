@@ -2,7 +2,7 @@ use std::{
     io::Read,
     num::NonZero,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdout, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,6 +11,48 @@ use std::{
     thread,
 };
 
+use crate::process::hidden_command;
+
+struct FfmpegPcmSource {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+impl Iterator for FfmpegPcmSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut sample = [0_u8; 4];
+        self.stdout.read_exact(&mut sample).ok()?;
+        Some(f32::from_le_bytes(sample))
+    }
+}
+
+impl rodio::Source for FfmpegPcmSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        NonZero::new(2).unwrap()
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        NonZero::new(48_000).unwrap()
+    }
+
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+impl Drop for FfmpegPcmSource {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct AudioPlayback {
     player: rodio::Player,
     _device: rodio::MixerDeviceSink,
@@ -18,7 +60,7 @@ struct AudioPlayback {
 
 impl AudioPlayback {
     fn start(ffmpeg: &Path, path: &Path, position_secs: f32) -> Result<Self, String> {
-        let decoded = Command::new(ffmpeg)
+        let mut child = hidden_command(ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-ss"])
             .arg(format!("{position_secs:.3}"))
             .arg("-i")
@@ -26,36 +68,22 @@ impl AudioPlayback {
             .args([
                 "-map", "0:a:0?", "-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1",
             ])
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|error| format!("Could not start FFmpeg audio decoder: {error}"))?;
-        if !decoded.status.success() {
-            return Err(format!(
-                "Could not decode clip audio: {}",
-                String::from_utf8_lossy(&decoded.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("unknown FFmpeg error")
-            ));
-        }
-        let samples = decoded
+        let stdout = child
             .stdout
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-            .collect::<Vec<_>>();
-        if samples.is_empty() {
-            return Err("This clip has no audio track".into());
-        }
+            .take()
+            .ok_or_else(|| "FFmpeg audio decoder did not expose a stream".to_owned())?;
 
         let mut device = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|error| format!("Could not open the default audio output: {error}"))?;
         device.log_on_drop(false);
         let player = rodio::Player::connect_new(device.mixer());
         player.pause();
-        player.append(rodio::buffer::SamplesBuffer::new(
-            NonZero::new(2).unwrap(),
-            NonZero::new(48_000).unwrap(),
-            samples,
-        ));
+        player.append(FfmpegPcmSource { child, stdout });
         Ok(Self {
             player,
             _device: device,
@@ -69,11 +97,15 @@ impl AudioPlayback {
     fn stop(self) {
         self.player.stop();
     }
+
+    fn set_volume(&self, volume: f32) {
+        self.player.set_volume(volume.clamp(0.0, 1.5));
+    }
 }
 
-pub const PREVIEW_WIDTH: usize = 960;
-pub const PREVIEW_HEIGHT: usize = 540;
-const PREVIEW_FPS: f32 = 60.0;
+pub const PREVIEW_WIDTH: usize = 854;
+pub const PREVIEW_HEIGHT: usize = 480;
+const PREVIEW_FPS: f32 = 30.0;
 
 #[derive(Debug)]
 pub struct VideoFrame {
@@ -87,7 +119,6 @@ enum PlayerEvent {
     Failed(String),
 }
 
-#[derive(Default)]
 pub struct VideoPlayer {
     path: Option<PathBuf>,
     duration_secs: f32,
@@ -97,6 +128,25 @@ pub struct VideoPlayer {
     cancel: Option<Arc<AtomicBool>>,
     error: Option<String>,
     audio: Option<AudioPlayback>,
+    volume: f32,
+    muted: bool,
+}
+
+impl Default for VideoPlayer {
+    fn default() -> Self {
+        Self {
+            path: None,
+            duration_secs: 0.0,
+            position_secs: 0.0,
+            playing: false,
+            receiver: None,
+            cancel: None,
+            error: None,
+            audio: None,
+            volume: 1.0,
+            muted: false,
+        }
+    }
 }
 
 impl VideoPlayer {
@@ -183,6 +233,28 @@ impl VideoPlayer {
         self.error.as_deref()
     }
 
+    pub fn volume(&self) -> f32 {
+        self.volume
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.5);
+        if let Some(audio) = &self.audio {
+            audio.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
+    }
+
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if let Some(audio) = &self.audio {
+            audio.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
+    }
+
     fn spawn_decoder(&mut self, ffmpeg: &Path, single_frame: bool) {
         let Some(path) = self.path.clone() else {
             return;
@@ -212,6 +284,7 @@ impl VideoPlayer {
     fn install_audio(&mut self, audio: Result<AudioPlayback, String>) {
         match audio {
             Ok(audio) => {
+                audio.set_volume(if self.muted { 0.0 } else { self.volume });
                 audio.play();
                 self.audio = Some(audio);
             }
@@ -244,7 +317,7 @@ fn decode(
     cancel: Arc<AtomicBool>,
     sender: SyncSender<PlayerEvent>,
 ) {
-    let mut command = Command::new(ffmpeg);
+    let mut command = hidden_command(ffmpeg);
     command
         .args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{start_secs:.3}"));
@@ -255,9 +328,11 @@ fn decode(
         .arg("-i")
         .arg(input)
         .args([
+            "-threads",
+            "2",
             "-an",
             "-vf",
-            "fps=60,scale=960:540:force_original_aspect_ratio=decrease,pad=960:540:(ow-iw)/2:(oh-ih)/2:black",
+            "fps=30,scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2:black",
             "-pix_fmt",
             "rgba",
             "-f",

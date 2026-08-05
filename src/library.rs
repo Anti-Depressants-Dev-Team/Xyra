@@ -1,8 +1,8 @@
-use std::{fs, path::Path, process::Command};
+use std::{fs, path::Path};
 
 use chrono::{DateTime, Utc};
 
-use crate::model::Clip;
+use crate::{model::Clip, process::hidden_command};
 
 pub fn scan_clips(directory: &Path, ffmpeg_path: Option<&Path>) -> std::io::Result<Vec<Clip>> {
     fs::create_dir_all(directory)?;
@@ -43,7 +43,7 @@ pub fn scan_clips(directory: &Path, ffmpeg_path: Option<&Path>) -> std::io::Resu
 }
 
 fn probe_duration(ffmpeg: &Path, video: &Path) -> Option<f32> {
-    let output = Command::new(ffmpeg)
+    let output = hidden_command(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(video)
         .output()
